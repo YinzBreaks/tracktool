@@ -9,11 +9,14 @@ later stage indexes that cache.
 
 from __future__ import annotations
 
+import atexit
+import gc
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
@@ -82,14 +85,21 @@ def _fourcc_str(v: float) -> str:
 
 
 def run_ffprobe(path: str) -> dict:
-    """Optional richer metadata from a local ffprobe binary, if on PATH. Never required."""
+    """Optional richer metadata from a local ffprobe binary, if on PATH. Never required.
+
+    shutil.which appends PATHEXT on Windows, so "ffprobe" finds ffprobe.exe. The call never goes
+    through a shell, and on Windows CREATE_NO_WINDOW stops a console window flashing up when the
+    GUI (a windowed executable) runs it.
+    """
     exe = shutil.which("ffprobe")
     if not exe:
         return {}
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
         res = subprocess.run(
             [exe, "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", path],
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False,
+            creationflags=flags,
         )
         streams = json.loads(res.stdout or "{}").get("streams", [])
         return streams[0] if streams else {}
@@ -98,9 +108,15 @@ def run_ffprobe(path: str) -> dict:
 
 
 def probe(path: str, compute_hash: bool = True) -> VideoMeta:
+    if not os.path.isfile(path):
+        raise IOError(f"No such file: {path}")
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        raise IOError(f"OpenCV could not open video: {path}")
+        hint = ""
+        if os.name == "nt" and not path.isascii():
+            hint = (" (the path contains non-ASCII characters; OpenCV's FFmpeg backend on Windows cannot open some "
+                    "such paths - copy the file to a plain ASCII path and retry)")
+        raise IOError(f"OpenCV could not open video: {path}{hint}")
     try:
         meta = VideoMeta(
             path=os.path.abspath(path),
@@ -245,13 +261,126 @@ class FrameCache:
             self.warnings.append(msg)
 
     def close(self) -> None:
-        if self._memmap_path:
-            self.frames = np.zeros((0, 1, 1), np.uint8)
+        """Release the frame store and delete the disk cache, if any.
+
+        On Windows a memory-mapped file cannot be deleted while any mapping of it is alive, and
+        `self.frames` is a view (`store[:n]`) of the memmap, as is every frame handed out through
+        `__getitem__` that a caller may still hold (the GUI's current frame, a tracker template...).
+        So: drop our own references, collect cycles, try to delete, and if the file is still busy
+        leave it for an atexit retry rather than failing the caller.
+        """
+        path, self._memmap_path = self._memmap_path, None
+        self.frames = np.zeros((0, 1, 1), np.uint8)
+        if path:
+            gc.collect()
+            _remove_cache_file(path)
+
+
+_PENDING_REMOVAL: set[str] = set()
+
+
+def _remove_cache_file(path: str) -> bool:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:          # PermissionError on Windows while a view is still mapped
+        if not _PENDING_REMOVAL:
+            atexit.register(_remove_pending)
+        _PENDING_REMOVAL.add(path)
+        return False
+    _PENDING_REMOVAL.discard(path)
+    return True
+
+
+def _remove_pending() -> None:
+    gc.collect()
+    for path in list(_PENDING_REMOVAL):
+        try:
+            os.remove(path)
+            _PENDING_REMOVAL.discard(path)
+        except OSError:
+            pass
+
+
+def default_cache_dir() -> str:
+    """Folder for disk frame caches: $UAPKA_CACHE_DIR, else the system temp dir (%TEMP% on Windows)."""
+    d = os.environ.get("UAPKA_CACHE_DIR")
+    return os.path.abspath(d) if d else tempfile.gettempdir()
+
+
+def available_memory_bytes() -> Optional[int]:
+    """Physical memory not currently in use, without psutil. None if unknown."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                            ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullAvailPhys)
+            return None
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo", encoding="ascii", errors="replace") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
+            return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES"))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def default_ram_budget_bytes() -> int:
+    """Bytes of grayscale frames to keep in RAM before switching to a disk memmap.
+
+    $UAPKA_RAM_BUDGET_MB overrides. Otherwise at most 2 GiB, and no more than half of the memory
+    currently available (the decoded frames are not the only large array: FPN maps, templates and
+    the GUI's colour frames come on top). Never below 256 MiB; a 32-bit interpreter is capped at 1 GiB.
+    """
+    env = os.environ.get("UAPKA_RAM_BUDGET_MB")
+    if env:
+        try:
+            return max(64, int(float(env))) * 1024 ** 2
+        except ValueError:
+            pass
+    budget = 2 * 1024 ** 3
+    avail = available_memory_bytes()
+    if avail:
+        budget = min(budget, max(256 * 1024 ** 2, avail // 2))
+    if sys.maxsize < 2 ** 32:
+        budget = min(budget, 1024 ** 3)
+    return int(budget)
+
+
+def sweep_stale_caches(directory: Optional[str] = None, max_age_s: float = 24 * 3600) -> int:
+    """Delete uapka_*.u8 cache files older than max_age_s left behind by crashed runs. Busy files are skipped."""
+    directory = directory or default_cache_dir()
+    n = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    import time
+    now = time.time()
+    for name in names:
+        if name.startswith("uapka_") and name.endswith(".u8"):
+            fn = os.path.join(directory, name)
             try:
-                os.remove(self._memmap_path)
+                if now - os.path.getmtime(fn) > max_age_s:
+                    os.remove(fn)
+                    n += 1
             except OSError:
                 pass
-            self._memmap_path = None
+    return n
 
 
 def overlay_mask_bgr(frame: np.ndarray, chroma_thresh: int = 14) -> Optional[np.ndarray]:
@@ -266,10 +395,16 @@ def overlay_mask_bgr(frame: np.ndarray, chroma_thresh: int = 14) -> Optional[np.
     return cv2.dilate(m, np.ones((5, 5), np.uint8))
 
 
-def load_frames(meta: VideoMeta, ram_budget_bytes: int = 2 * 1024**3, cache_dir: Optional[str] = None,
+def load_frames(meta: VideoMeta, ram_budget_bytes: Optional[int] = None, cache_dir: Optional[str] = None,
                 progress: Optional[ProgressFn] = None, cancel: Optional[CancelFn] = None,
                 start_s: float = 0.0, end_s: Optional[float] = None, colour_overlays: bool = True) -> FrameCache:
-    """Decode [start_s, end_s] of the video into the cache (sequentially; no seeking)."""
+    """Decode [start_s, end_s] of the video into the cache (sequentially; no seeking).
+
+    Frames stay in RAM up to `ram_budget_bytes` (default: see default_ram_budget_bytes); longer clips go to
+    a uint8 memmap file in `cache_dir` (default: see cache_dir()), which is checked for free space first.
+    """
+    if ram_budget_bytes is None:
+        ram_budget_bytes = default_ram_budget_bytes()
     cap = cv2.VideoCapture(meta.path)
     if not cap.isOpened():
         raise IOError(f"OpenCV could not open video: {meta.path}")
@@ -283,9 +418,26 @@ def load_frames(meta: VideoMeta, ram_budget_bytes: int = 2 * 1024**3, cache_dir:
     memmap_path = None
     if use_memmap:
         cap_n = int(expected * 1.1) + 16
-        fd, memmap_path = tempfile.mkstemp(prefix="uapka_", suffix=".u8", dir=cache_dir)
+        directory = cache_dir or default_cache_dir()
+        os.makedirs(directory, exist_ok=True)
+        sweep_stale_caches(directory)
+        need = cap_n * h * w
+        try:
+            free = shutil.disk_usage(directory).free
+        except OSError:
+            free = None
+        if free is not None and free < need + 256 * 1024 ** 2:
+            raise IOError(
+                f"The clip needs a {need / 1e9:.1f} GB frame cache on disk but {directory} has only "
+                f"{free / 1e9:.1f} GB free. Analyse a segment (start/end time), free space, or set "
+                "UAPKA_CACHE_DIR to a drive with room.")
+        fd, memmap_path = tempfile.mkstemp(prefix="uapka_", suffix=".u8", dir=directory)
         os.close(fd)
-        store = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(cap_n, h, w))
+        try:
+            store = np.memmap(memmap_path, dtype=np.uint8, mode="w+", shape=(cap_n, h, w))
+        except (OSError, ValueError) as e:
+            _remove_cache_file(memmap_path)
+            raise IOError(f"Could not create the {need / 1e9:.1f} GB frame cache in {directory}: {e}") from e
     else:
         cap_n = None
         store = []
@@ -331,11 +483,23 @@ def load_frames(meta: VideoMeta, ram_budget_bytes: int = 2 * 1024**3, cache_dir:
             n += 1
             if progress and n % 10 == 0:
                 progress(min(n / expected, 0.99), f"Decoding frame {first + n}")
+    except BaseException:
+        cap.release()
+        if use_memmap:
+            del store
+            gc.collect()
+            _remove_cache_file(memmap_path)
+        raise
     finally:
         cap.release()
     if n == 0:
+        if use_memmap:
+            del store
+            gc.collect()
+            _remove_cache_file(memmap_path)
         raise IOError("No frames could be decoded in the requested segment.")
     frames = store[:n] if use_memmap else np.stack(store)
+    del store                  # keep a single reference chain: fc.frames -> memmap
     if first == 0 and last is None:
         meta.frame_count_decoded = n
         meta.duration_s = n / meta.fps

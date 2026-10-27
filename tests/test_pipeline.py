@@ -12,7 +12,7 @@ from uapka.project import Project
 from uapka.scenarios import ScenarioSpec, compute_scenarios
 from uapka.video import load_frames, probe
 
-from .conftest import analysed_project, make_clip, true_rate
+from .conftest import analysed_project, lossless_writer, make_clip, true_rate
 
 
 def test_track_accuracy(lossless_project, lossless_clip):
@@ -112,7 +112,7 @@ def test_duplicate_frames_are_detected(tmp_path, lossless_clip):
             break
         frames.append(f)
     out = str(tmp_path / "dups.avi")
-    w = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"FFV1"), 30.0, frames[0].shape[1::-1])
+    w = lossless_writer(out, 30.0, frames[0].shape[1::-1])
     dup_idx = set(range(10, len(frames), 10))
     for i, f in enumerate(frames):
         w.write(frames[i - 1] if i in dup_idx else f)

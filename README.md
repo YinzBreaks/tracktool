@@ -32,9 +32,11 @@ assumptions you entered, each peak with its 1σ and the noise floor, plus a "pea
 
 ## Install and run (Windows)
 
-1. Install Python 3.10+ from python.org (tick "Add to PATH").
-2. Double-click **`run_uapka.bat`**. The first run creates `.venv` and installs the dependencies.
-   This is the only step that needs internet. After it, everything runs offline.
+1. Install 64-bit Python 3.10+ from python.org (tick "Add python.exe to PATH").
+2. Double-click **`run_uapka.bat`**. The first run creates `.venv` next to it and installs the
+   dependencies. This is the only step that needs internet. After it, everything runs offline.
+   The same script runs the command line: `run_uapka.bat analyze clip.mp4 --out results ...`
+   (any `uapka` command; see the CLI section). If a run fails, the window stays open with the error.
 
 Manual install, any OS:
 
@@ -42,17 +44,65 @@ Manual install, any OS:
 py -3 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python -m uapka            REM GUI
-.venv\Scripts\python -m pytest           REM tests (about 40 s)
+.venv\Scripts\python -m pytest           REM tests (about 50 s)
 ```
 
 Optional: if `ffprobe` (FFmpeg) is on `PATH`, the metadata panel also shows the codec profile, pixel
 format, field order (interlacing) and sample aspect ratio. Decoding never needs it.
 
-Single-folder executable: `pip install pyinstaller` then
-`pyinstaller -w -n UAPKA --collect-submodules uapka uapka_launcher.py`.
+**Self-contained folder (no Python on the target machine):** run `build_windows.bat` (it creates the
+venv if needed, installs PyInstaller and runs the versioned `uapka.spec`; by hand:
+`pyinstaller --noconfirm --clean uapka.spec`). The result is `dist\UAPKA\` with two executables
+sharing one `_internal\` folder:
+
+- `UAPKA.exe`: the GUI, windowed (no console). Double-click, or pass a video / `project.json` path.
+- `uapka-cli.exe`: the command line (`info`, `synth`, `analyze`, `check-env`). A windowed executable
+  has no console output on Windows, which is why the CLI is a second, console-mode exe.
+
+Zip `dist\UAPKA\` to distribute it. Because `UAPKA.exe` has no console, anything it would print
+(including a crash traceback) goes to `%LOCALAPPDATA%\uapka\uapka.log`.
+
+Frame cache: clips are decoded once to grayscale. They stay in RAM up to a budget (2 GiB, or half of
+the RAM currently available if that is less; override with `UAPKA_RAM_BUDGET_MB`), beyond that they go
+to a memory-mapped file in `%TEMP%` (override with `UAPKA_CACHE_DIR`; free space is checked first, and
+the file is deleted when the video is closed or at exit).
 
 > `opencv-python-headless` is intentional: the regular `opencv-python` wheel bundles its own Qt
-> plugins, and those conflict with PySide6.
+> plugins, and those conflict with PySide6. The spec refuses to build if `cv2` ships Qt plugins.
+
+### Troubleshooting
+
+First run the self-check and read its `FAIL`/`WARN` lines:
+
+```bat
+.venv\Scripts\python tools\check_env.py      REM source install
+dist\UAPKA\uapka-cli.exe check-env            REM frozen build
+```
+
+It reports Python/Qt/OpenCV versions, whether the FFV1 / HFYU / mp4v / MJPG writers open, whether a Qt
+platform plugin loads, ffprobe, console encoding, free disk in the cache folder and available RAM.
+
+- **The GUI does not appear, or "no Qt platform plugin could be initialized"**: install the Microsoft
+  Visual C++ Redistributable (x64); make sure neither `PyQt5`/`PyQt6` nor the non-headless
+  `opencv-python` is installed in the venv (`check_env` reports both); `set QT_DEBUG_PLUGINS=1`
+  shows which plugin failed. For `UAPKA.exe`, look in `%LOCALAPPDATA%\uapka\uapka.log`.
+- **`UnicodeEncodeError` or garbled `±`/`σ` in a console**: the CLI switches its own output to UTF-8;
+  for other Python scripts (`tools\validate.py` does it itself) set `PYTHONUTF8=1`, as
+  `run_uapka.bat` does. Exported CSV/Markdown/HTML files are always UTF-8.
+- **"The clip needs N GB frame cache on disk"**: the segment is too long for RAM and `%TEMP%` is
+  short of space. Analyse a segment (start/end seconds), or point `UAPKA_CACHE_DIR` at a drive with
+  room. Leftover `uapka_*.u8` files in that folder come from crashed runs; they are removed
+  automatically after 24 h and are safe to delete.
+- **"OpenCV could not open video"**: try a path without non-ASCII characters (OpenCV's FFmpeg backend
+  on Windows fails on some); unusual containers can be re-muxed losslessly with
+  `ffmpeg -i in.ext -c copy out.mp4`. `uapka info clip` shows what OpenCV sees.
+- **Annotated video came out as `.avi`**, or "No video writer could be opened": the `mp4v` writer is
+  missing from the OpenCV build, so MJPG/AVI was used (or export with the video off). Synthetic clips
+  fall back from FFV1 to HuffYUV, then MJPG, and say so.
+- **First start takes a minute**: matplotlib builds its font cache once; antivirus scanning of a fresh
+  PyInstaller folder adds to it. SmartScreen warns about unsigned executables: "More info, Run anyway".
+- **Closing the window during a long run**: the job is cancelled and the program waits for the worker
+  thread (up to 30 s) before exiting, so the frame cache file can be deleted.
 
 ---
 
@@ -256,6 +306,27 @@ A turn that appears only on screen comes from camera motion.
 
 With compensation switched off (`--static-camera`), all on-screen motion is attributed to the
 object. Every affected value is then labelled `MEASURED+FOV+ASSUMED-STATIC-CAMERA`.
+
+### Deriving the FOV (`fov.py`)
+Released footage rarely states its field of view, so `uapka fov <method>` derives the HFOV from
+things an analyst can know, with a 1σ and the inputs recorded. The geometry is an exact pinhole:
+the angle between two clicked points is the angle between their rays, and the focal length is
+solved so that it matches the known true angle (the small-angle shortcut θ·W/d is only reported as
+a sanity check; it is several percent off for off-centre points at wide FOVs).
+
+| Method | Known inputs | Label |
+|---|---|---|
+| `separation` | two points and the true angle between them (± σ) | `DERIVED-FOV(separation)` |
+| `size` | two points spanning an **assumed** size at an **assumed** range (± σ each) | `DERIVED-FOV(size)` |
+| `geo` | camera lat/lon/alt and ≥ 2 geo-located landmarks clicked in the frame (WGS-84, local ENU); ≥ 3 adds a consistency residual | `DERIVED-FOV(geo)` |
+| `hud` | a user-supplied table of HUD zoom labels → HFOV | `DERIVED-FOV(hud)` |
+
+Click uncertainty (±1 px per point by default) and every input σ are propagated by finite
+differences and combined in quadrature. `--save fov.json` stores the estimate;
+`analyze --fov-json fov.json` applies it and the report states the method, inputs and HFOV ± σ
+(`--hfov` wins if both are given, and is reported as "user input, no uncertainty given"). All
+angular rates and scenario values scale linearly with the HFOV, so its relative σ carries straight
+through to them.
 
 ### 5. Scenarios (`scenarios.py`): ASSUMED only
 For an assumed range R (held constant):

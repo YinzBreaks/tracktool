@@ -11,7 +11,7 @@ from uapka.project import Project
 from uapka.tracker import Track
 from uapka.video import load_frames, probe
 
-from .conftest import make_clip
+from .conftest import lossless_writer, make_clip
 
 
 def _rewrite(src, dst, transform):
@@ -23,7 +23,7 @@ def _rewrite(src, dst, transform):
             break
         frames.append(f)
     out = transform(frames)
-    w = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"FFV1"), 30.0, out[0].shape[1::-1])
+    w = lossless_writer(dst, 30.0, out[0].shape[1::-1])
     for f in out:
         w.write(f)
     w.release()

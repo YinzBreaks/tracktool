@@ -44,6 +44,8 @@ class Project:
     notes: str = ""
     tracks: list = field(default_factory=list)
     active: int = 0
+    fov_estimates: list = field(default_factory=list)   # derived-FOV estimates (fov.FovEstimate.to_dict()), optional
+    fov_source: Optional[dict] = None                   # the estimate that set kin_params.hfov_deg (+ "index"), if any
     # runtime (not serialised directly)
     meta: Optional[VideoMeta] = None
     cache: Optional[FrameCache] = None
@@ -105,6 +107,8 @@ class Project:
             "tracks": [t.to_dict() for t in self.tracks],
             "active": self.active,
             "notes": self.notes,
+            "fov_estimates": list(self.fov_estimates),
+            "fov_source": self.fov_source,
         }
 
     def save(self, path: str) -> None:
@@ -126,6 +130,8 @@ class Project:
             kin_params=KinParams(**d.get("kin_params", {})),
             scenario=ScenarioSpec(**d.get("scenario", {})),
             notes=d.get("notes", ""),
+            fov_estimates=list(d.get("fov_estimates") or []),     # absent in older project files
+            fov_source=d.get("fov_source"),
         )
         if d.get("tracks"):
             p.tracks = [Track.from_dict(t) for t in d["tracks"]]
@@ -133,6 +139,47 @@ class Project:
             p.tracks = [Track.from_dict(d["track"])]
         p.active = min(int(d.get("active", 0)), max(len(p.tracks) - 1, 0))
         return p
+
+    # ---------------- derived field of view (fov.py)
+    def apply_fov(self, estimate, index: Optional[int] = None) -> list[str]:
+        """Use a derived FOV estimate (fov.FovEstimate or its dict) as the HFOV: sets kin_params.hfov_deg, keeps the
+        estimate in fov_estimates and records it as fov_source (with its index) so reports can state the provenance.
+        Returns warnings (frame size / pixel aspect mismatch). Kinematics are NOT recomputed here."""
+        from .fov import FovEstimate
+        est = estimate.to_dict() if isinstance(estimate, FovEstimate) else dict(estimate)
+        est.pop("index", None)
+        if not est.get("hfov_deg") or float(est["hfov_deg"]) <= 0:
+            raise ValueError("FOV estimate has no positive hfov_deg")
+        if index is None:
+            if est not in self.fov_estimates:
+                self.fov_estimates.append(est)
+            index = self.fov_estimates.index(est)
+        else:
+            self.fov_estimates[index] = est
+        self.kin_params.hfov_deg = float(est["hfov_deg"])
+        self.fov_source = {**est, "index": index}
+        warnings = []
+        if self.meta is not None and (int(est.get("width", self.meta.width)), int(est.get("height", self.meta.height))) \
+                != (self.meta.width, self.meta.height):
+            warnings.append(f"FOV estimate was made for a {est.get('width')}x{est.get('height')} frame but the video is "
+                            f"{self.meta.width}x{self.meta.height}: the HFOV only transfers if the frame was scaled "
+                            "without cropping.")
+        if abs(float(est.get("pixel_aspect", 1.0)) - self.kin_params.pixel_aspect) > 1e-6:
+            warnings.append(f"FOV estimate assumed pixel aspect {est.get('pixel_aspect')} but the project uses "
+                            f"{self.kin_params.pixel_aspect:g}.")
+        self.log += warnings
+        return warnings
+
+    def fov_status(self) -> tuple[str, Optional[dict]]:
+        """('derived', estimate) if the HFOV in use came from apply_fov and has not been edited since; ('manual', None)
+        if it was typed in (or edited after applying an estimate); ('none', None) if no HFOV is set."""
+        h = self.kin_params.hfov_deg
+        if not h or h <= 0:
+            return "none", None
+        src = self.fov_source
+        if src and abs(float(src.get("hfov_deg", -1.0)) - h) <= 1e-4:   # GUI spin box keeps 4 decimals
+            return "derived", src
+        return "manual", None
 
     # ---------------- pipeline steps
     def open_video(self, path: str, progress=None, cancel=None) -> list[str]:

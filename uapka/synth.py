@@ -13,10 +13,45 @@ estimate on the same clip and compare both against truth.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+# Writers tried in order when the requested codec cannot be opened. FFV1 and HuffYUV (HFYU) are lossless
+# and ship in the FFmpeg that opencv-python bundles on every platform; MJPG is the lossy last resort.
+LOSSLESS_CODECS = ("FFV1", "HFYU")
+FALLBACK_CODECS = ("MJPG",)
+
+
+def open_writer(path: str, codec: str, fps: float, size: tuple) -> tuple:
+    """Open a cv2.VideoWriter, falling back through lossless codecs, then MJPG.
+
+    Returns (writer, codec_used, note). `note` is "" when the requested codec opened, otherwise a sentence
+    explaining the substitution (surfaced to the user by the CLI/GUI and recorded in the truth file).
+    """
+    tried = []
+    order = [codec] + [c for c in LOSSLESS_CODECS + FALLBACK_CODECS if c != codec]
+    for c in order:
+        w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*c), fps, size)
+        if w.isOpened():
+            note = ""
+            if c != codec:
+                lossy = c not in LOSSLESS_CODECS
+                note = (f"Codec {codec} is not available in this OpenCV build; wrote {c} instead"
+                        + (" (LOSSY: ground-truth checks will be looser)." if lossy else " (lossless)."))
+            return w, c, note
+        w.release()
+        tried.append(c)
+        if os.path.exists(path) and os.path.getsize(path) == 0:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    ext = os.path.splitext(path)[1] or "(none)"
+    raise IOError(f"No video writer could be opened for {path} (tried {', '.join(tried)}; container {ext}). "
+                  "Check that OpenCV's FFmpeg backend is present: run tools/check_env.py.")
 
 
 @dataclass
@@ -83,9 +118,7 @@ def generate(path: str, cfg: SynthConfig = SynthConfig()) -> dict:
     obj_ref = np.stack([W / 2 + np.tan(np.radians(ang[:, 0])) * f0,
                         H / 2 - np.tan(np.radians(ang[:, 1])) * f0], axis=1)
 
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*cfg.codec), cfg.fps, (W, H))
-    if not writer.isOpened():
-        raise IOError("Could not open video writer")
+    writer, codec_used, codec_note = open_writer(path, cfg.codec, cfg.fps, (W, H))
     screen = np.zeros((n, 2))
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
     for k in range(n):
@@ -116,6 +149,8 @@ def generate(path: str, cfg: SynthConfig = SynthConfig()) -> dict:
     rate = np.gradient(ang, t, axis=0)
     truth = {
         "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()},
+        "codec_used": codec_used,
+        "codec_note": codec_note,
         "f0_px": f0,
         "t": t.tolist(),
         "object_screen_px": screen.tolist(),
@@ -130,6 +165,6 @@ def generate(path: str, cfg: SynthConfig = SynthConfig()) -> dict:
             {"x": W - 152, "y": 8, "w": 144, "h": 34, "kind": "REDACTION"},
         ] if cfg.hud else [],
     }
-    with open(path + ".truth.json", "w") as f:
+    with open(path + ".truth.json", "w", encoding="utf-8") as f:
         json.dump(truth, f)
     return truth

@@ -109,13 +109,30 @@ def export_figures(p: Project, outdir: str) -> dict[str, str]:
 OBJ_BGR = [(255, 160, 40), (40, 120, 255), (120, 200, 30), (200, 80, 200), (30, 200, 230)]
 
 
+def _remove_empty(path: str) -> None:
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) == 0:
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def export_annotated_video(p: Project, path: str, trail_frames: int = 45, progress=None, cancel=None) -> str:
     meta, kin = p.meta, p.kin
     W, H = meta.width, meta.height
+    # mp4v in .mp4 works with the FFmpeg backend bundled in opencv-python on Windows, macOS and Linux;
+    # MJPG in .avi is the fallback for builds without an MPEG-4 encoder.
     writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), meta.fps, (W, H))
     if not writer.isOpened():
+        writer.release()
+        _remove_empty(path)
         path = os.path.splitext(path)[0] + ".avi"
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), meta.fps, (W, H))
+    if not writer.isOpened():
+        writer.release()
+        _remove_empty(path)
+        raise IOError("No video writer (mp4v or MJPG) could be opened; the annotated video was not written. "
+                      "Export with the video disabled, or run tools/check_env.py to inspect the OpenCV build.")
     n = len(p.cache)
     A = p.camera.A if (p.camera is not None and p.kin_params.use_camera) else np.repeat(np.eye(3)[None], n, 0)
     omega = kin.cols.get("omega", (None, None, None))[2] if kin is not None else None
@@ -293,11 +310,24 @@ def build_report(p: Project, figs: dict[str, str]) -> tuple[str, str]:
     md += [f"- {line}" for line in meta.summary_lines()]
     md.append("")
     md.append("## 2. Inputs and assumptions")
-    hfov = f"{kp.hfov_deg:g} deg (user input)" if kp.hfov_deg else "**not supplied** – angular values unavailable"
+    fov_status, fov_src = p.fov_status()
+    fov_notes: list[str] = []
+    if fov_status == "derived":
+        from .fov import SCALING_NOTE, describe_inputs
+        sig = (f"± {fov_src['sigma_deg']:.2g} deg ({fov_src.get('sigma_pct', 0.0):.1f}%)" if fov_src.get("sigma_deg")
+               else "(no uncertainty given)")
+        hfov = (f"{kp.hfov_deg:.4g} {sig} **[{fov_src['label']}]** – derived by the '{fov_src['method']}' method from "
+                f"{describe_inputs(fov_src)}. {SCALING_NOTE}")
+        fov_notes = [n for n in fov_src.get("notes", []) if n != SCALING_NOTE]
+    elif fov_status == "manual":
+        hfov = f"{kp.hfov_deg:g} deg (user input, no uncertainty given)"
+    else:
+        hfov = "**not supplied** – angular values unavailable"
     md += [
         f"- Segment: video frames {p.file_frame(0)}–{p.file_frame(len(p.cache) - 1)} "
         f"({p.frame_times()[0]:.2f}–{p.frame_times()[-1]:.2f} s)",
         f"- Horizontal field of view at reference frame: {hfov}",
+        *[f"  - {n}" for n in fov_notes],
         f"- Pixel aspect ratio: {kp.pixel_aspect:g}",
         f"- Timing: {kp.timing} ({meta.fps:.3f} fps nominal)",
         f"- Derivative window: {kp.window_frames} frames, polynomial order {kp.poly_order}",

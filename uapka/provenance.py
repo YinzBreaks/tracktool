@@ -24,6 +24,15 @@ class Prov(str, Enum):
     STATIC_CAM = "MEASURED+FOV+ASSUMED-STATIC-CAMERA"
     # Same assumption, pixel quantities (no FOV involved).
     STATIC_CAM_PX = "MEASURED+ASSUMED-STATIC-CAMERA"
+    # A field of view that was not typed in but derived (fov.py) from reference information: two points with a
+    # known angle, an assumed object size/range, geo-located landmarks, or a HUD-label table. Carries a 1-sigma.
+    # Reported as "DERIVED-FOV(<method>)", see derived_fov_label().
+    DERIVED_FOV = "DERIVED-FOV"
+
+
+def derived_fov_label(method: str) -> str:
+    """Provenance label of a derived field of view, e.g. 'DERIVED-FOV(geo)'."""
+    return f"{Prov.DERIVED_FOV.value}({method})"
 
 
 PROV_DESCRIPTIONS = {
@@ -43,6 +52,12 @@ PROV_DESCRIPTIONS = {
     Prov.ASSUMED: (
         "Depends on a scenario assumption (slant range, object size, or altitude). "
         "Scales linearly with the assumed range. Not a measurement."
+    ),
+    Prov.DERIVED_FOV: (
+        "A horizontal field of view derived from reference information rather than typed in: DERIVED-FOV(separation) "
+        "two points with a known angle; DERIVED-FOV(size) two points spanning an ASSUMED size at an ASSUMED range; "
+        "DERIVED-FOV(geo) geo-located landmarks and camera position; DERIVED-FOV(hud) a user-supplied HUD-label "
+        "table. Each carries a 1-sigma; every MEASURED+FOV and ASSUMED value scales linearly with it."
     ),
 }
 

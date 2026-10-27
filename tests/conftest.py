@@ -5,7 +5,7 @@ import pytest
 
 from uapka.masks import Mask
 from uapka.project import Project
-from uapka.synth import SynthConfig, generate
+from uapka.synth import SynthConfig, generate, open_writer
 
 SMALL = dict(width=320, height=240, seconds=3.0, pan_rate_px_s=(40.0, -10.0))
 
@@ -16,6 +16,15 @@ def make_clip(tmp_path_factory, name, **kw):
     path = str(tmp_path_factory.mktemp("clips") / f"{name}.{ext}")
     truth = generate(path, cfg)
     return path, truth
+
+
+def lossless_writer(path, fps, size):
+    """cv2.VideoWriter for a lossless .avi; FFV1 with a lossless fallback so a missing encoder gives a clear
+    error (not a silently empty file) on any platform."""
+    w, codec, note = open_writer(path, "FFV1", fps, size)
+    if codec not in ("FFV1", "HFYU"):
+        pytest.skip(f"no lossless video encoder in this OpenCV build: {note}")
+    return w
 
 
 def analysed_project(path, truth, **kin):
