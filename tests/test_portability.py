@@ -126,7 +126,7 @@ def test_probe_reports_missing_file_clearly(tmp_path):
 def test_a_bare_path_argument_opens_the_gui(monkeypatch, lossless_clip):
     path, _ = lossless_clip
     opened = {}
-    monkeypatch.setattr(cli, "cmd_gui", lambda a: opened.setdefault("path", a.path) or 0)
+    monkeypatch.setattr(cli, "cmd_gui", lambda a: (opened.__setitem__("path", a.path), 0)[1])
     assert cli.main([path]) == 0 and opened["path"] == path     # what drag-and-drop onto UAPKA.exe passes
     with pytest.raises(SystemExit):
         cli.main(["no-such-file-or-command"])
