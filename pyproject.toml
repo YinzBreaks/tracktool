@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uapka"
+version = "0.1.0"
+description = "UAP Kinematics Analyzer: offline video kinematics with explicit measured/assumed labelling"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python-headless>=4.8",
+    "matplotlib>=3.7",
+    "PySide6>=6.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+uapka = "uapka.cli:main"
+
+[project.gui-scripts]
+uapka-gui = "uapka.gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["uapka*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

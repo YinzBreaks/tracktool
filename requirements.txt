@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+# headless build on purpose: the GUI uses PySide6's Qt; opencv-python ships its own Qt plugins that clash with it
+opencv-python-headless>=4.8
+matplotlib>=3.7
+PySide6>=6.5
+pytest>=7
