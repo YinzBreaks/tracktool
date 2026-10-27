@@ -217,7 +217,10 @@ class Kinematics:
         v = self.trusted
         if self.has_angles():
             w, sw = self.get("omega"), self.get("omega_sigma")
-            a, sa = self.get("alpha"), self.get("alpha_sigma")
+            if "alpha" in self.cols:        # absent for poly_order 1 (velocity only)
+                a, sa = self.get("alpha"), self.get("alpha_sigma")
+            else:
+                a = sa = np.full_like(w, np.nan)
             ok = v & np.isfinite(w)
             if ok.any():
                 i = np.nanargmax(np.where(ok, w, np.nan))

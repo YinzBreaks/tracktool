@@ -10,7 +10,7 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 STATUS_COLORS = {"OK": "#3fc85a", "MANUAL": "#2fd0e8", "REACQ": "#f0c020", "LOST": "#ff4040", "WEAK": "#ff4040",
-                 "AMBIGUOUS": "#ff9a3c", "EXCLUDED": "#a0a0a0", "BLANK": "#606060"}
+                 "AMBIGUOUS": "#ff9a3c", "EXCLUDED": "#a0a0a0", "BLANK": "#606060", "DUP": "#4a4a48"}
 MASK_COLORS = {"HUD": "#2a78d6", "RETICLE": "#c040c0", "WATERMARK": "#d09020", "REDACTION": "#707070",
                "OTHER": "#909090"}
 

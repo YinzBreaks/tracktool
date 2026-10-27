@@ -7,7 +7,7 @@ jump there with a click.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtCore import QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
@@ -25,11 +25,15 @@ class Timeline(QWidget):
         self.conf = None
         self.keyframes = []
         self.current = 0
-        self.setToolTip("Track status (top: green OK, cyan manual, yellow re-acquired, red lost) and camera-motion "
-                        "confidence (bottom: dark = low). Click to jump.")
+        self.setToolTip("Track status (top: green OK, cyan manual, yellow re-acquired, red lost/weak, orange "
+                        "ambiguous, grey excluded, dark grey duplicate/blank; white ticks = keyframes) and "
+                        "camera-motion confidence (bottom: dark = low). Click to jump.")
 
     def set_data(self, n, status=None, conf=None, keyframes=()):
-        self.n, self.status, self.conf, self.keyframes = n, status, conf, list(keyframes)
+        self.n, self.status, self.conf, self.keyframes = int(n), status, conf, list(keyframes)
+        if self.n <= 0:
+            self.status = self.conf = None
+            self.keyframes = []
         self.update()
 
     def set_current(self, k):
