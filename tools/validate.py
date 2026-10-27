@@ -77,4 +77,5 @@ def run(workdir: str) -> None:
 
 if __name__ == "__main__":
     wd = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="uapka_val_")
+    os.makedirs(wd, exist_ok=True)
     run(wd)

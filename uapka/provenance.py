@@ -19,6 +19,9 @@ class Prov(str, Enum):
     # Requires a scenario assumption (slant range, object size or altitude).
     # Scales linearly with that assumption; not a measurement.
     ASSUMED = "ASSUMED"
+    # Angles of the object computed WITHOUT camera-motion compensation, under the explicit assumption that the
+    # camera was not moving. Used when the user switches compensation off (e.g. camera motion unmeasurable).
+    STATIC_CAM = "MEASURED+FOV+ASSUMED-STATIC-CAMERA"
 
 
 PROV_DESCRIPTIONS = {
@@ -26,6 +29,10 @@ PROV_DESCRIPTIONS = {
     Prov.MEASURED_FOV: (
         "Measured pixel motion converted to angles using the user-supplied horizontal "
         "field of view and pixel aspect ratio. Scales linearly with the FOV value."
+    ),
+    Prov.STATIC_CAM: (
+        "Measured image motion converted to angles with the FOV, attributing ALL of it to the object because the "
+        "camera is ASSUMED static (camera-motion compensation switched off). Wrong if the camera moved."
     ),
     Prov.ASSUMED: (
         "Depends on a scenario assumption (slant range, object size, or altitude). "

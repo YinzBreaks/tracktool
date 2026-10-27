@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 import cv2
 import numpy as np
 
-MASK_KINDS = ("HUD", "RETICLE", "WATERMARK", "REDACTION", "OTHER")
+MASK_KINDS = ("HUD", "RETICLE", "WATERMARK", "REDACTION", "BORDER", "OTHER")
 
 
 @dataclass
@@ -79,8 +79,33 @@ def suggest_static_overlays(frames, n_samples: int = 60, min_area: int = 30,
     gy = cv2.Sobel(mean, cv2.CV_32F, 0, 1)
     grad = cv2.magnitude(gx, gy)
     structured = cv2.dilate((grad > 20).astype(np.uint8), np.ones((5, 5), np.uint8))
-    flat_block = cv2.erode(static, np.ones((9, 9), np.uint8))
+    # redaction blocks: static, flat AND near-black/near-white (uniform mid-grey sky is static and flat too)
+    extreme = ((mean < 25) | (mean > 235)).astype(np.uint8)
+    flat_block = cv2.erode(static & extreme, np.ones((9, 9), np.uint8))
     cand = (static & structured) | flat_block
+    # Letterbox / frame-border bands: edge rows/columns that are almost entirely static. Reported as their own
+    # masks and removed from the candidate map, otherwise they chain every edge-touching overlay together.
+    H0, W0 = static.shape
+    borders = []
+    for side in ("top", "bottom", "left", "right"):
+        lines = {"top": static, "bottom": static[::-1], "left": static.T, "right": static.T[::-1]}[side]
+        depth = 0
+        while depth < min(H0, W0) // 8 and lines[depth].mean() > 0.9:
+            depth += 1
+        depth = depth + 2 if depth else 0
+        if depth:
+            borders.append({"top": Mask(0, 0, W0, depth), "bottom": Mask(0, H0 - depth, W0, depth),
+                            "left": Mask(0, 0, depth, H0), "right": Mask(W0 - depth, 0, depth, H0)}[side])
+            borders[-1].kind, borders[-1].label = "BORDER", "auto-suggested frame border"
+        b = max(depth, 4)
+        if side == "top":
+            cand[:b, :] = 0
+        elif side == "bottom":
+            cand[-b:, :] = 0
+        elif side == "left":
+            cand[:, :b] = 0
+        else:
+            cand[:, -b:] = 0
     # merge fragments (letters of a HUD word, arms of a reticle) into one region
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, np.ones((17, 17), np.uint8))
     cand = cv2.dilate(cand, np.ones((5, 5), np.uint8))
@@ -91,7 +116,7 @@ def suggest_static_overlays(frames, n_samples: int = 60, min_area: int = 30,
         return [], "More than half the frame is static; camera probably not moving. No suggestions."
     num, _, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
     H, W = cand.shape
-    out = []
+    out = list(borders)
     for i in range(1, num):
         x, y, w, h, area = stats[i]
         if area < min_area:

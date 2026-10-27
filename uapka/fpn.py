@@ -73,9 +73,18 @@ def estimate_fpn(frames, excluded: Optional[np.ndarray] = None, n_samples: int =
     static_fraction = rms_pattern / max(rms_frames, 1e-6)
     med = np.median(pattern[keep])
     mad = 1.4826 * np.median(np.abs(pattern[keep] - med)) + 1e-6
-    defects = ((np.abs(pattern - med) > 6 * mad) & keep).astype(np.uint8) * 255
+    defects = _defects(pattern, med, mad, keep)
     del stack
     return FPNModel(pattern, defects, static_fraction, len(idx), hp_sigma)
+
+
+def _defects(pattern: np.ndarray, med: float, mad: float, keep: np.ndarray, max_frac: float = 0.005) -> np.ndarray:
+    """Hot/dead pixels: > 6 robust sigma, capped at the worst `max_frac` of pixels (heavy-tailed
+    patterns such as vignetting residue would otherwise flag large areas and starve registration)."""
+    z = np.abs(pattern - med) / mad
+    z[~keep] = 0
+    thr = max(6.0, float(np.quantile(z[keep], 1 - max_frac))) if keep.any() else 6.0
+    return ((z > thr) & keep).astype(np.uint8) * 255
 
 
 def clean_frame(img: np.ndarray, fpn: Optional[FPNModel], destripe: bool = True, hp_sigma: float = 30.0,
@@ -158,5 +167,5 @@ def refine_fpn_with_motion(frames, A: np.ndarray, fpn: FPNModel, excluded: Optio
     keep = np.ones((H, W), bool) if excluded is None else excluded == 0
     med = np.median(pattern[keep])
     mad = 1.4826 * np.median(np.abs(pattern[keep] - med)) + 1e-6
-    defects = ((np.abs(pattern - med) > 6 * mad) & keep).astype(np.uint8) * 255
+    defects = _defects(pattern, med, mad, keep)
     return FPNModel(pattern, defects, fpn.static_fraction, len(idx), fpn.hp_sigma)

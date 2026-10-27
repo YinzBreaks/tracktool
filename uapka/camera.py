@@ -49,6 +49,9 @@ class CameraParams:
     gop_mode: str = "auto"          # "auto" | "off": I-frame anchor correction for compression lag
     keyframe_mad_ratio: float = 2.0 # frame-difference spike threshold for keyframe (I-frame) detection
     max_width: int = 960            # register on a downscaled copy above this width (results in full-res px)
+    motion_model: str = "auto"      # auto (zoom/roll kept only where a consistent trend is significant) | similarity | translation
+    trend_window: int = 30          # new-content steps over which zoom/roll trends are tested
+    closure_frames: int = 10        # long-baseline consistency check every N new-content frames (0 = off)
     fpn_refine: bool = True         # 2nd pass: scene-based FPN re-estimate using the 1st motion estimate
     max_features: int = 400
     ransac_thresh_px: float = 1.0
@@ -80,11 +83,17 @@ class CameraTrack:
     A: np.ndarray                    # (N,3,3): frame k pixel -> reference (frame 0) pixel
     fpn_info: str = ""
     gop_info: str = ""
+    closure_info: str = ""
+    model_info: str = ""
     anchors: list = field(default_factory=list)
 
     def T(self, k: int) -> np.ndarray:
-        """3x3 mapping frame k-1 -> k."""
-        return np.vstack([self.pairs[k].M, [0, 0, 1]])
+        """3x3 mapping frame k-1 -> k (background)."""
+        return self.between(k - 1, k)
+
+    def between(self, j: int, k: int) -> np.ndarray:
+        """3x3 mapping frame j -> frame k (background). Valid across skipped frames."""
+        return np.linalg.inv(self.A[k]) @ self.A[j]
 
     def confidence(self) -> np.ndarray:
         return np.array([p.confidence for p in self.pairs])
@@ -217,6 +226,9 @@ def _feature_register(prev_c: np.ndarray, cur_c: np.ndarray, excluded: np.ndarra
                     flags.append("CHOSE_MOVING_OVER_STATIC_CLUSTER")
                 flags.append("STATIC_CLUSTER_PRESENT" if (id1 or id2) else "TWO_MOTION_CLUSTERS")
     n_in = int(inl.sum())
+    if params.motion_model == "translation" and n_in >= 3:
+        t_only = np.median(dst[inl] - src[inl], axis=0)
+        M = np.array([[1, 0, t_only[0]], [0, 1, t_only[1]]], float)
     pred = src[inl] @ M[:, :2].T + M[:, 2]
     rms = float(np.sqrt(np.mean(np.sum((pred - dst[inl]) ** 2, axis=1)))) if n_in else float("nan")
     coverage = _coverage(dst[inl], allowed)
@@ -326,9 +338,16 @@ def detect_gop_lag(mad: np.ndarray, step_px: np.ndarray, ratio: float, min_gap: 
     return spikes, at / max(el, 1e-3)
 
 
-def object_exclusion(shape, boxes: list[Optional[tuple[float, float, float, float]]], margin: int) -> np.ndarray:
+def object_exclusion(shape, boxes: list, margin: int) -> np.ndarray:
+    """boxes: (cx, cy, w, h) tuples, None, or lists of those (several objects per frame)."""
     m = np.zeros(shape[:2], np.uint8)
+    flat = []
     for bx in boxes:
+        if isinstance(bx, list):
+            flat += bx
+        else:
+            flat.append(bx)
+    for bx in flat:
         if bx is None:
             continue
         cx, cy, w, h = bx
@@ -355,23 +374,34 @@ class _Scaled:
 
 def estimate_camera_motion(frames, masks: list[Mask], params: CameraParams,
                            object_boxes: Optional[Callable[[int], Optional[tuple]]] = None,
-                           progress=None, cancel=None) -> CameraTrack:
-    """Register every consecutive frame pair. object_boxes(k) -> (cx, cy, w, h) or None.
+                           progress=None, cancel=None, skip: Optional[np.ndarray] = None,
+                           overlay: Optional[Callable[[int], Optional[np.ndarray]]] = None) -> CameraTrack:
+    """Register consecutive frames. object_boxes(k) -> (cx, cy, w, h) or None.
 
+    skip[k] marks frames with no new image content (duplicates, blank dropouts):
+    they are stepped over, and registration bridges from the last real frame.
+    overlay(k) -> uint8 mask of per-frame burned-in symbology to exclude.
     All returned transforms are in full-resolution pixel coordinates.
     """
     W = frames[0].shape[1]
     if W <= params.max_width:
-        return _estimate(frames, masks, params, object_boxes, progress, cancel)
+        return _estimate(frames, masks, params, object_boxes, progress, cancel, skip, overlay)
     f = params.max_width / W
     sm = [Mask(int(m.x * f), int(m.y * f), int(np.ceil(m.w * f)) + 1, int(np.ceil(m.h * f)) + 1, m.kind, m.label)
           for m in masks]
-    ob = None
+    ob = ov = None
+    scaled = _Scaled(frames, f)
     if object_boxes is not None:
         def ob(k):
             b = object_boxes(k)
+            if isinstance(b, list):
+                return [tuple(v * f for v in x) for x in b if x is not None]
             return None if b is None else tuple(v * f for v in b)
-    ct = _estimate(_Scaled(frames, f), sm, params, ob, progress, cancel)
+    if overlay is not None:
+        def ov(k):
+            m = overlay(k)
+            return None if m is None else cv2.resize(m, scaled.size, interpolation=cv2.INTER_NEAREST)
+    ct = _estimate(scaled, sm, params, ob, progress, cancel, skip, ov)
     S, Si = np.diag([f, f, 1.0]), np.diag([1 / f, 1 / f, 1.0])
     ct.A = np.einsum("ij,njk,kl->nil", Si, ct.A, S)
     for p in ct.pairs:
@@ -384,27 +414,31 @@ def estimate_camera_motion(frames, masks: list[Mask], params: CameraParams,
     return ct
 
 
-def _estimate(frames, masks: list[Mask], params: CameraParams, object_boxes, progress, cancel) -> CameraTrack:
+def _estimate(frames, masks: list[Mask], params: CameraParams, object_boxes, progress, cancel,
+              skip=None, overlay=None) -> CameraTrack:
     n = len(frames)
     shape = frames[0].shape
     user_excl = mask_image(masks, shape)
     if user_excl.any():
         user_excl = cv2.dilate(user_excl, np.ones((7, 7), np.uint8))
+    skip = np.zeros(n, bool) if skip is None else np.asarray(skip, bool)
     fpn: Optional[FPNModel] = None
     fpn_info = "FPN removal disabled."
     if params.fpn_mode != "off" and n >= 3:
         if progress:
             progress(0.0, "Estimating fixed-pattern noise")
-        fpn = estimate_fpn(frames, user_excl, hp_sigma=params.hp_sigma_px)
+        fpn = estimate_fpn(_Subset(frames, np.flatnonzero(~skip)), user_excl, hp_sigma=params.hp_sigma_px)
         fpn_info = fpn.describe()
     two_pass = fpn is not None and params.fpn_refine and fpn.static_fraction > 0.5
     span = 0.45 if two_pass else 0.9
-    ct = _register_all(frames, fpn, user_excl, params, object_boxes, progress, cancel, 0.0, span)
+    args = (user_excl, params, object_boxes, progress, cancel, skip, overlay)
+    ct = _register_all(frames, fpn, *args, 0.0, span)
     if two_pass:
         if progress:
             progress(span, "Refining FPN with the scene model")
-        fpn = refine_fpn_with_motion(frames, ct.A, fpn, user_excl)
-        ct = _register_all(frames, fpn, user_excl, params, object_boxes, progress, cancel, span, 0.9)
+        act = np.flatnonzero(~skip)
+        fpn = refine_fpn_with_motion(_Subset(frames, act), ct.A[act], fpn, user_excl)
+        ct = _register_all(frames, fpn, *args, span, 0.9)
         fpn_info += " Refined in a second pass using the scene mosaic (scene-based nonuniformity correction)."
     ct.fpn_info = fpn_info
     if progress:
@@ -412,7 +446,19 @@ def _estimate(frames, masks: list[Mask], params: CameraParams, object_boxes, pro
     return ct
 
 
-def _register_all(frames, fpn, user_excl, params, object_boxes, progress, cancel, p0, p1) -> CameraTrack:
+class _Subset:
+    def __init__(self, frames, idx):
+        self.frames, self.idx = frames, idx
+
+    def __len__(self):
+        return len(self.idx)
+
+    def __getitem__(self, k):
+        return self.frames[int(self.idx[k])]
+
+
+def _register_all(frames, fpn, user_excl, params, object_boxes, progress, cancel, skip, overlay,
+                  p0, p1) -> CameraTrack:
     n = len(frames)
     shape = frames[0].shape
     defect_excl = cv2.dilate(fpn.defects, np.ones((5, 5), np.uint8)) if fpn is not None else None
@@ -424,49 +470,163 @@ def _register_all(frames, fpn, user_excl, params, object_boxes, progress, cancel
         excl = user_excl.copy()
         if defect_excl is not None:
             excl |= defect_excl
+        if overlay is not None:
+            for k in ks:
+                m = overlay(k)
+                if m is not None:
+                    excl |= m
         if object_boxes is not None:
             excl |= object_exclusion(shape, [object_boxes(k) for k in ks], params.object_margin_px)
         return excl
 
-    pairs = [PairResult(M=np.array([[1, 0, 0], [0, 1, 0]], float), confidence=1.0, method="ref")]
-    A = np.zeros((n, 3, 3))
-    A[0] = np.eye(3)
-    mad = np.full(n, np.nan)
-    prev_c = prep(0)
-    for k in range(1, n):
+    act = [k for k in range(n) if not skip[k]] or [0]
+    ident = np.array([[1, 0, 0], [0, 1, 0]], float)
+    pairs = [PairResult(M=ident.copy(), confidence=1.0, method="ref") for _ in range(n)]
+    A = np.repeat(np.eye(3)[None], n, axis=0)
+    mad_act = np.full(len(act), np.nan)
+    step_act = np.zeros(len(act))
+    prev_c = prep(act[0])
+    for i in range(1, len(act)):
+        a, b = act[i - 1], act[i]
         if cancel and cancel():
             raise InterruptedError("Cancelled")
-        cur_c = prep(k)
-        mad[k] = float(cv2.absdiff(frames[k], frames[k - 1]).mean())
-        pr = register_pair(frames[k - 1], frames[k], prev_c, cur_c, exclusion(k - 1, k), params)
-        pairs.append(pr)
-        A[k] = A[k - 1] @ np.linalg.inv(np.vstack([pr.M, [0, 0, 1]]))
+        cur_c = prep(b)
+        mad_act[i] = float(cv2.absdiff(frames[b], frames[a]).mean())
+        pr = register_pair(frames[a], frames[b], prev_c, cur_c, exclusion(a, b), params)
+        if b - a > 1:
+            pr.flags = pr.flags + [f"BRIDGED_{b - a - 1}_SKIPPED"]
+        pairs[b] = pr
+        step_act[i] = float(np.hypot(pr.M[0, 2], pr.M[1, 2]))
+        for k in range(a + 1, b):     # duplicates/blanks: no new image, camera unknown -> hold
+            A[k] = A[a]
+            pairs[k] = PairResult(M=ident.copy(), confidence=pr.confidence, method="skipped",
+                                  sigma_px=0.0, flags=["SKIPPED_FRAME"])
+        A[b] = A[a] @ np.linalg.inv(np.vstack([pr.M, [0, 0, 1]]))
         prev_c = cur_c
-        if progress and k % 5 == 0:
-            progress(p0 + (p1 - p0) * k / n, f"Registering frame {k}/{n - 1}")
+        if progress and i % 5 == 0:
+            progress(p0 + (p1 - p0) * i / len(act), f"Registering frame {b}/{n - 1}")
+    for k in range(act[-1] + 1, n):
+        A[k] = A[act[-1]]
     ct = CameraTrack(pairs=pairs, A=A)
+    if params.motion_model == "auto":
+        ct.model_info = _simplify_model(ct, act, shape, params)
 
-    # --- Compression lag check and I-frame anchor correction
-    step = np.array([0.0] + [float(np.hypot(p.M[0, 2], p.M[1, 2])) for p in pairs[1:]])
-    keys, catchup = detect_gop_lag(mad, step, params.keyframe_mad_ratio)
+    # --- Compression lag check and I-frame anchor correction (on new-content frames only)
+    keys_i, catchup = detect_gop_lag(mad_act, step_act, params.keyframe_mad_ratio)
+    keys = [act[i] for i in keys_i]
     ct.gop_info = f"{len(keys)} keyframe-like frame-difference spikes; camera-step catch-up ratio {catchup:.2f}."
     if len(keys) >= 2 and catchup > 1.3:
         ct.gop_info += (" Background motion appears to lag between keyframes and catch up at them "
                         "(compression freezing a low-texture background).")
         if params.gop_mode == "auto":
-            _anchor_correct(ct, frames, [0] + keys, prep, exclusion, params)
-            ct.gop_info += f" Corrected by registering {len(ct.anchors)} keyframes directly and interpolating."
+            if _anchor_correct(ct, frames, [act[0]] + keys, prep, exclusion, params):
+                ct.gop_info += f" Corrected by registering {len(ct.anchors)} keyframes directly and interpolating."
+            else:
+                ct.gop_info += (" Direct keyframe-to-keyframe registration either failed or agreed with the "
+                                "frame-to-frame chain, so the lag hypothesis is not confirmed and no anchor "
+                                "correction was applied.")
         else:
             ct.gop_info += " Anchor correction is OFF; treat in-between camera motion as unreliable."
+    if params.closure_frames and not ct.anchors and len(act) > params.closure_frames:
+        _closure_check(ct, frames, act, prep, exclusion, params)
     return ct
 
 
-def _anchor_correct(ct: CameraTrack, frames, anchors: list[int], prep, exclusion, params: CameraParams) -> None:
+def _simplify_model(ct: CameraTrack, act: list[int], shape, params: CameraParams) -> str:
+    """Keep zoom / roll only where they form a significant trend.
+
+    A real zoom or roll is consistent across many steps; per-step estimates on weak backgrounds are noise, and
+    chaining noise in scale/rotation produces fake zoom and roll (and, through the centre of rotation, fake pan).
+    Over each window of `trend_window` steps the median log-scale (rotation) is compared with its random-walk
+    expectation from the step-to-step scatter; where it is not > 5 sigma the term is removed, keeping the
+    motion of the image centre unchanged.
+    """
+    H, W = shape[:2]
+    c = np.array([W / 2.0, H / 2.0])
+    steps = act[1:]
+    if len(steps) < 6:
+        return ""
+    ls = np.array([np.log(np.sqrt(abs(np.linalg.det(ct.pairs[k].M[:, :2])))) for k in steps])
+    rot = np.array([np.arctan2(ct.pairs[k].M[1, 0], ct.pairs[k].M[0, 0]) for k in steps])
+    Wn = min(params.trend_window, len(steps))
+
+    from scipy.ndimage import median_filter
+
+    def significant(x):
+        # windowed median: a real zoom/roll is a consistent per-step bias; isolated garbage steps (e.g. at
+        # compression keyframes) must not count as a trend
+        noise = 1.4826 * np.median(np.abs(np.diff(x))) / np.sqrt(2) + 1e-12
+        movmed = median_filter(x, size=Wn, mode="nearest")
+        return np.abs(movmed) > 5 * 1.25 * noise / np.sqrt(Wn)
+
+    keep_s, keep_r = significant(ls), significant(rot)
+    for i, k in enumerate(steps):
+        M = np.vstack([ct.pairs[k].M, [0, 0, 1]])
+        s_ = np.exp(ls[i]) if keep_s[i] else 1.0
+        a_ = rot[i] if keep_r[i] else 0.0
+        R = s_ * np.array([[np.cos(a_), -np.sin(a_)], [np.sin(a_), np.cos(a_)]])
+        tc = (M[:2, :2] @ c + M[:2, 2]) - c          # motion of the image centre is preserved
+        t = c + tc - R @ c
+        ct.pairs[k].M = np.hstack([R, t[:, None]])
+    A = ct.A
+    for i in range(1, len(act)):
+        a, b = act[i - 1], act[i]
+        for k in range(a + 1, b):
+            A[k] = A[a]
+        A[b] = A[a] @ np.linalg.inv(np.vstack([ct.pairs[b].M, [0, 0, 1]]))
+    for k in range(act[-1] + 1, len(A)):
+        A[k] = A[act[-1]]
+    return (f"Motion model: zoom kept in {int(keep_s.sum())}/{len(steps)} steps, roll kept in "
+            f"{int(keep_r.sum())}/{len(steps)} steps (significant trends only); elsewhere translation only.")
+
+
+def _closure_check(ct: CameraTrack, frames, act: list[int], prep, exclusion, params: CameraParams) -> None:
+    """Long-baseline consistency: register frames ~closure_frames apart directly, starting from the chained
+    estimate, and compare. Frame-to-frame registration can be confidently wrong (locked to sensor-fixed or
+    encoder-frozen content); a direct registration across a longer interval exposes that. If the scene cannot
+    be registered across the interval at all, the chained motion is unverifiable and is capped below trust."""
+    L = params.closure_frames
+    n_ok = n_bad = n_unv = 0
+    H, W = frames[0].shape[:2]
+    for i in range(0, len(act) - 1, L):
+        j = min(i + L, len(act) - 1)
+        a, b = act[i], act[j]
+        guess = ct.between(a, b)
+        warped = cv2.warpAffine(prep(a), guess[:2], (W, H), flags=cv2.INTER_LINEAR)
+        excl = exclusion(a, b) | cv2.warpAffine(exclusion(a), guess[:2], (W, H), flags=cv2.INTER_NEAREST,
+                                                borderValue=255)
+        est = _feature_register(warped, prep(b), excl, _allowed(excl, params.border_px), params)
+        chain_sig = float(np.sqrt(sum(ct.pairs[act[m]].sigma_px ** 2 for m in range(i + 1, j + 1))))
+        if est is None or est["quality"] < 0.3:
+            cap, flag = 0.25, "CLOSURE_UNVERIFIABLE"
+            n_unv += 1
+        else:
+            resid = float(np.hypot(*est["M"][:, 2]))
+            if resid > max(1.5, 3 * chain_sig):
+                cap, flag = 0.1, "CLOSURE_INCONSISTENT"
+                n_bad += 1
+            else:
+                cap, flag = 1.0, None
+                n_ok += 1
+        for m in range(i + 1, j + 1):
+            for k in range(act[m - 1] + 1, act[m] + 1):
+                pr = ct.pairs[k]
+                pr.confidence = min(pr.confidence, cap)
+                if flag:
+                    pr.flags = pr.flags + [flag]
+    ct.closure_info = (f"Long-baseline check every {L} new frames: {n_ok} consistent, {n_bad} inconsistent, "
+                       f"{n_unv} unverifiable (scene could not be registered across the interval).")
+
+
+def _anchor_correct(ct: CameraTrack, frames, anchors: list[int], prep, exclusion, params: CameraParams) -> bool:
     n = len(frames)
     anchors = sorted(set(a for a in anchors if 0 <= a < n))
     A_chain = ct.A.copy()
     A_anc = {anchors[0]: A_chain[anchors[0]]}
     anc_conf, anc_sigma = {anchors[0]: 1.0}, {anchors[0]: 0.0}
+    H0, W0 = frames[0].shape[:2]
+    centre = np.array([W0 / 2.0, H0 / 2.0, 1.0])
+    disagree, travel, shrink = [], [], []
     prev_c = prep(anchors[0])
     for a, b in zip(anchors[:-1], anchors[1:]):
         cur_c = prep(b)
@@ -483,8 +643,26 @@ def _anchor_correct(ct: CameraTrack, frames, anchors: list[int], prep, exclusion
             M_ab = np.vstack([est["M"], [0, 0, 1]]) @ guess
             A_anc[b] = A_anc[a] @ np.linalg.inv(M_ab)
             anc_conf[b] = est["quality"]
+            if est["quality"] >= 0.3:
+                # chain displacement vs direct keyframe registration over this interval
+                d_anc = (M_ab @ centre)[:2] - centre[:2]
+                d_chain = (guess @ centre)[:2] - centre[:2]
+                disagree.append(float(np.hypot(*(d_anc - d_chain))))
+                travel.append(float(np.hypot(*d_anc)))
+                if travel[-1] > 3.0:
+                    shrink.append(1.0 - float(np.dot(d_chain, d_anc) / np.dot(d_anc, d_anc)))
             anc_sigma[b] = _step_sigma(est["rms"], est["n_in"], est["quality"])
         prev_c = cur_c
+    if np.median([anc_conf[a] for a in anchors[1:]]) < 0.3 or not disagree:
+        return False
+    # Lag is confirmed only if the chain genuinely lost motion relative to the keyframes: either grossly (large
+    # disagreement) or systematically (the chain is consistently SHORT along the direction of travel; random
+    # registration noise has no preferred sign). Otherwise anchoring would only replace good per-frame
+    # measurements with an interpolation.
+    gross = np.median(disagree) >= max(2.0, 0.05 * float(np.median(travel)))
+    systematic = len(shrink) >= 2 and np.median(shrink) > 0.03 and np.mean(np.array(shrink) > 0) >= 0.75
+    if not (gross or systematic):
+        return False
     ks = np.array(anchors)
     P = np.array([_sim_params(A_anc[a]) for a in anchors])
     P[:, 3] = np.unwrap(P[:, 3])
@@ -496,15 +674,21 @@ def _anchor_correct(ct: CameraTrack, frames, anchors: list[int], prep, exclusion
             A_new[k] = _sim_matrix(interp(k))
         else:  # after the final keyframe: chain increments relative to it
             A_new[k] = A_anc[last] @ np.linalg.inv(A_chain[last]) @ A_chain[k]
-    ct.A = A_new
     ct.anchors = anchors
-    for k in range(1, n):
+    first = anchors[0]
+    for k in range(n):
+        if k < first:
+            A_new[k] = A_chain[k]
+    ct.A = A_new
+    for k in range(first + 1, n):
+        if ct.pairs[k].method == "skipped":
+            continue
         if k > last:
             pr = ct.pairs[k]
             pr.flags = pr.flags + ["AFTER_LAST_KEYFRAME"]
             pr.confidence = min(pr.confidence, 0.2)
             continue
-        i = int(np.searchsorted(ks, k))   # first anchor >= k (ks[0] == 0 < k, so i >= 1)
+        i = int(np.searchsorted(ks, k))   # first anchor >= k (ks[0] < k, so i >= 1)
         prv, nxt = int(ks[i - 1]), int(ks[i])
         pr = ct.pairs[k]
         T = np.linalg.inv(A_new[k]) @ A_new[k - 1]
@@ -513,6 +697,7 @@ def _anchor_correct(ct: CameraTrack, frames, anchors: list[int], prep, exclusion
         pr.flags = pr.flags + ["GOP_ANCHOR_INTERPOLATED"]
         pr.confidence = float(min(anc_conf[prv], anc_conf[nxt])) * 0.8
         pr.sigma_px = float(max(anc_sigma[nxt], 0.05))
+    return True
 
 
 def naive_phase_correlation_track(frames) -> np.ndarray:

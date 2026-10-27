@@ -58,7 +58,8 @@ def test_every_csv_column_is_labelled_and_scenarios_scale(lossless_project, tmp_
     with open(tmp_path / "per_frame.csv") as f:
         header = next(csv.reader(f))
     data_cols = [h for h in header if h not in ("frame", "used_in_fit", "in_summaries", "flags")]
-    assert all(re.search(r"\[(MEASURED|MEASURED\+FOV|ASSUMED)\]$", h) for h in data_cols), data_cols
+    assert all(re.search(r"\[(MEASURED|MEASURED\+FOV|ASSUMED|MEASURED\+FOV\+ASSUMED-STATIC-CAMERA)\]$", h)
+               for h in data_cols), data_cols
     assert not any("ASSUMED" in h for h in header), "per-frame CSV must contain no scenario values"
     with open(tmp_path / "scenario_sweep.csv") as f:
         rows = list(csv.reader(f))

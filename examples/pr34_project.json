@@ -1,0 +1,161 @@
+{
+ "tool": "uapka",
+ "version": "0.1.0",
+ "video_path": "pr34_small.mp4",
+ "video_sha256": "8d164a44fabc97da1e8cc057ce1140a7d83827dbb6760b4dfce23d9cb7d38bd3",
+ "segment_start_s": 4.0,
+ "segment_end_s": 48.0,
+ "masks": [
+  {
+   "x": 0,
+   "y": 0,
+   "w": 960,
+   "h": 9,
+   "kind": "BORDER",
+   "label": "auto-suggested frame border"
+  },
+  {
+   "x": 10,
+   "y": 15,
+   "w": 69,
+   "h": 76,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 412,
+   "y": 16,
+   "w": 252,
+   "h": 47,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 904,
+   "y": 28,
+   "w": 43,
+   "h": 24,
+   "kind": "HUD",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 10,
+   "y": 244,
+   "w": 61,
+   "h": 96,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 834,
+   "y": 409,
+   "w": 118,
+   "h": 131,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 13,
+   "y": 489,
+   "w": 39,
+   "h": 51,
+   "kind": "HUD",
+   "label": "auto-suggested"
+  }
+ ],
+ "camera_params": {
+  "fpn_mode": "auto",
+  "destripe": true,
+  "hp_sigma_px": 30.0,
+  "smooth_sigma_px": 2.0,
+  "gop_mode": "auto",
+  "keyframe_mad_ratio": 2.0,
+  "max_width": 960,
+  "motion_model": "auto",
+  "trend_window": 30,
+  "closure_frames": 10,
+  "fpn_refine": true,
+  "max_features": 400,
+  "ransac_thresh_px": 1.0,
+  "fb_thresh_px": 0.7,
+  "min_inliers": 8,
+  "border_px": 8,
+  "object_margin_px": 12,
+  "pc_max_width": 400
+ },
+ "track_params": {
+  "search_radius_px": 24,
+  "lost_threshold": 0.45,
+  "template_update": 0.05,
+  "max_lost": 15,
+  "centroid_refine": true,
+  "snap_manual": true,
+  "polarity": "auto",
+  "preset": "sky",
+  "reacquire": true,
+  "manual_sigma_px": 1.0,
+  "mode": "auto",
+  "point_max_diameter_px": 6.0,
+  "snr_min": 4.0,
+  "gate_weight": 2.0
+ },
+ "kin_params": {
+  "hfov_deg": 0.0,
+  "pixel_aspect": 1.0,
+  "window_frames": 15,
+  "poly_order": 2,
+  "timing": "nominal",
+  "start_frame": 0,
+  "end_frame": -1,
+  "use_camera": true,
+  "low_conf_threshold": 0.3
+ },
+ "scenario": {
+  "mode": "range",
+  "values": "1km, 2km, 5km, 10km, 20km, 50km",
+  "cam_altitude": "0m",
+  "elevation_deg": 0.0,
+  "observer_vx_ms": 0.0,
+  "observer_vy_ms": 0.0
+ },
+ "tracks": [
+  {
+   "n": 1321,
+   "name": "obj1",
+   "role": "target",
+   "end": 356,
+   "start": -1,
+   "keyframes": {
+    "0": [
+     337.0,
+     480.0,
+     15.0,
+     15.0
+    ]
+   },
+   "excluded": [],
+   "polarity": "bright",
+   "mode": "point"
+  },
+  {
+   "n": 1321,
+   "name": "obj2",
+   "role": "target",
+   "end": -1,
+   "start": 333,
+   "keyframes": {
+    "336": [
+     319.0,
+     317.0,
+     15.0,
+     15.0
+    ]
+   },
+   "excluded": [],
+   "polarity": "bright",
+   "mode": "point"
+  }
+ ],
+ "active": 1,
+ "notes": ""
+}

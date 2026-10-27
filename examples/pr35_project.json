@@ -1,0 +1,279 @@
+{
+ "tool": "uapka",
+ "version": "0.1.0",
+ "video_path": "DOD_111689022-1920x1080-6000k.mp4",
+ "video_sha256": "e19937160930b13ae6a363ec6972e96553a3df97836a22a2e09f9bef966e7ce9",
+ "segment_start_s": 2.5,
+ "segment_end_s": 0.0,
+ "masks": [
+  {
+   "x": 0,
+   "y": 0,
+   "w": 1920,
+   "h": 10,
+   "kind": "BORDER",
+   "label": "auto-suggested frame border"
+  },
+  {
+   "x": 0,
+   "y": 1070,
+   "w": 1920,
+   "h": 10,
+   "kind": "BORDER",
+   "label": "auto-suggested frame border"
+  },
+  {
+   "x": 817,
+   "y": 11,
+   "w": 504,
+   "h": 92,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 0,
+   "y": 22,
+   "w": 160,
+   "h": 179,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 1837,
+   "y": 39,
+   "w": 83,
+   "h": 57,
+   "kind": "HUD",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 0,
+   "y": 486,
+   "w": 126,
+   "h": 166,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 1696,
+   "y": 808,
+   "w": 224,
+   "h": 264,
+   "kind": "REDACTION",
+   "label": "auto-suggested"
+  },
+  {
+   "x": 0,
+   "y": 987,
+   "w": 85,
+   "h": 85,
+   "kind": "HUD",
+   "label": "auto-suggested"
+  }
+ ],
+ "camera_params": {
+  "fpn_mode": "auto",
+  "destripe": true,
+  "hp_sigma_px": 30.0,
+  "smooth_sigma_px": 2.0,
+  "gop_mode": "auto",
+  "keyframe_mad_ratio": 2.0,
+  "max_width": 960,
+  "motion_model": "auto",
+  "trend_window": 30,
+  "closure_frames": 10,
+  "fpn_refine": true,
+  "max_features": 400,
+  "ransac_thresh_px": 1.0,
+  "fb_thresh_px": 0.7,
+  "min_inliers": 8,
+  "border_px": 8,
+  "object_margin_px": 12,
+  "pc_max_width": 400
+ },
+ "track_params": {
+  "search_radius_px": 24,
+  "lost_threshold": 0.45,
+  "template_update": 0.05,
+  "max_lost": 15,
+  "centroid_refine": true,
+  "snap_manual": true,
+  "polarity": "auto",
+  "preset": "sky",
+  "reacquire": true,
+  "manual_sigma_px": 1.0,
+  "mode": "auto",
+  "point_max_diameter_px": 6.0,
+  "snr_min": 4.0,
+  "gate_weight": 2.0
+ },
+ "kin_params": {
+  "hfov_deg": 0.0,
+  "pixel_aspect": 1.0,
+  "window_frames": 15,
+  "poly_order": 2,
+  "timing": "nominal",
+  "start_frame": 0,
+  "end_frame": -1,
+  "use_camera": true,
+  "low_conf_threshold": 0.3
+ },
+ "scenario": {
+  "mode": "range",
+  "values": "1km, 2km, 5km, 10km, 20km, 50km",
+  "cam_altitude": "0m",
+  "elevation_deg": 0.0,
+  "observer_vx_ms": 0.0,
+  "observer_vy_ms": 0.0
+ },
+ "tracks": [
+  {
+   "n": 220,
+   "name": "dot",
+   "role": "target",
+   "end": 141,
+   "start": 3,
+   "keyframes": {
+    "20": [
+     865.0,
+     641.0,
+     25.0,
+     25.0
+    ],
+    "43": [
+     985.0,
+     590.0,
+     15.0,
+     15.0
+    ],
+    "49": [
+     1034.0,
+     589.0,
+     15.0,
+     15.0
+    ],
+    "55": [
+     1083.0,
+     617.0,
+     25.0,
+     25.0
+    ],
+    "59": [
+     1101.0,
+     634.0,
+     25.0,
+     25.0
+    ],
+    "79": [
+     1095.0,
+     669.0,
+     25.0,
+     25.0
+    ],
+    "85": [
+     1083.0,
+     642.0,
+     25.0,
+     25.0
+    ],
+    "91": [
+     1052.0,
+     618.0,
+     25.0,
+     25.0
+    ],
+    "97": [
+     1018.0,
+     594.0,
+     25.0,
+     25.0
+    ],
+    "103": [
+     984.0,
+     578.0,
+     25.0,
+     25.0
+    ],
+    "115": [
+     975.0,
+     597.0,
+     25.0,
+     25.0
+    ],
+    "125": [
+     988.0,
+     602.0,
+     25.0,
+     25.0
+    ],
+    "135": [
+     994.0,
+     579.0,
+     25.0,
+     25.0
+    ]
+   },
+   "excluded": [
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70,
+    71,
+    72,
+    73,
+    74,
+    75,
+    76,
+    77,
+    78
+   ],
+   "polarity": "bright",
+   "mode": "point"
+  },
+  {
+   "n": 220,
+   "name": "cloud",
+   "role": "control",
+   "end": 127,
+   "start": 40,
+   "keyframes": {
+    "50": [
+     897.0,
+     601.0,
+     15.0,
+     15.0
+    ]
+   },
+   "excluded": [],
+   "polarity": "bright",
+   "mode": "template"
+  },
+  {
+   "n": 220,
+   "name": "coast",
+   "role": "control",
+   "end": -1,
+   "start": 150,
+   "keyframes": {
+    "150": [
+     1330.0,
+     609.0,
+     15.0,
+     15.0
+    ]
+   },
+   "excluded": [],
+   "polarity": "bright",
+   "mode": "template"
+  }
+ ],
+ "active": 0,
+ "notes": ""
+}

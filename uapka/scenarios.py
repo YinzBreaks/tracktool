@@ -125,6 +125,14 @@ def compute_scenarios(kin: Kinematics, spec: ScenarioSpec) -> ScenarioResult:
     an = kin.get("alpha_lateral") * D2R if has_acc else np.full_like(wx, np.nan)
     san = kin.get("alpha_lateral_sigma") * D2R if has_acc else np.full_like(wx, np.nan)
     valid = kin.trusted & np.isfinite(wx)
+    if not valid.any():
+        raise ValueError("No frames have trusted camera-motion estimates in their derivative window, so the object's "
+                         "angular motion is not separable from camera motion. Scenario values would be meaningless. "
+                         "(To proceed anyway, switch camera compensation off: that makes 'static camera' an explicit "
+                         "assumption carried by every value.)")
+    if not kin.params.use_camera:
+        notes.append("Static camera ASSUMED (camera-motion compensation off): all on-screen motion is attributed to "
+                     "the object.")
     rows: list[ScenarioRow] = []
     ts: dict = {}
     for R, label in rngs:

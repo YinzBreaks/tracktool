@@ -9,7 +9,8 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-STATUS_COLORS = {"OK": "#3fc85a", "MANUAL": "#2fd0e8", "REACQ": "#f0c020", "LOST": "#ff4040", "EXCLUDED": "#a0a0a0"}
+STATUS_COLORS = {"OK": "#3fc85a", "MANUAL": "#2fd0e8", "REACQ": "#f0c020", "LOST": "#ff4040", "WEAK": "#ff4040",
+                 "AMBIGUOUS": "#ff9a3c", "EXCLUDED": "#a0a0a0", "BLANK": "#606060"}
 MASK_COLORS = {"HUD": "#2a78d6", "RETICLE": "#c040c0", "WATERMARK": "#d09020", "REDACTION": "#707070",
                "OTHER": "#909090"}
 
@@ -41,6 +42,7 @@ class FrameView(QWidget):
         self.trail = None        # (N,2) array in current-frame px
         self.keyframe_here = False
         self.candidates = []     # list of (x, y, label)
+        self.others = []         # other tracked objects at this frame: (x, y, label)
         self.message = ""
 
     # ---------------------------------------------------------------- image
@@ -115,6 +117,11 @@ class FrameView(QWidget):
             pts = [self.to_widget(x, y) for x, y in self.trail]
             for a, b in zip(pts[:-1], pts[1:]):
                 p.drawLine(a, b)
+        for x, y, label in self.others:
+            c = self.to_widget(x, y)
+            p.setPen(QPen(QColor("#e87ba4"), 1.2))
+            p.drawEllipse(c, 7, 7)
+            p.drawText(c + QPointF(9, -6), label)
         for x, y, label in self.candidates:
             c = self.to_widget(x, y)
             p.setPen(QPen(QColor("#f0c020"), 1.5, Qt.DashLine))

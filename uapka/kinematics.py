@@ -24,14 +24,14 @@ import numpy as np
 
 from .camera import CameraTrack
 from .provenance import Prov, col
-from .tracker import Track
+from .tracker import Track, segment_ids
 
 
 @dataclass
 class KinParams:
     hfov_deg: float = 0.0          # horizontal field of view at the reference frame (0 = unknown)
     pixel_aspect: float = 1.0      # pixel width / pixel height
-    window_frames: int = 15        # local-fit window (odd); larger = less noise, less time resolution
+    window_frames: int = 15        # local-fit window in new-content frames (odd); larger = less noise, less time resolution
     poly_order: int = 2            # 2: velocity + acceleration; 3: less bias on sharp turns, more noise
     timing: str = "nominal"        # "nominal" (frame/fps) | "container" (decoder timestamps)
     start_frame: int = 0
@@ -41,24 +41,29 @@ class KinParams:
 
 
 def local_poly(t: np.ndarray, y: np.ndarray, sigma: np.ndarray, valid: np.ndarray, half_window: float,
-               order: int, min_side: int = 1) -> dict[str, np.ndarray]:
+               order: int, min_side: int = 1, segment: Optional[np.ndarray] = None) -> dict[str, np.ndarray]:
     """Local weighted polynomial fit centred on every valid sample.
 
     Returns value, d1, d2 and their 1-sigma, plus number of points used. Model:
     y(t_i + tau) = b0 + b1 tau + b2 tau^2/2 [+ b3 tau^3/6].
     Samples with fewer than `min_side` neighbours on either side (clip edges,
     gaps) get no derivative: one-sided fits extrapolate and produce spurious
-    "manoeuvres" exactly where the data ends.
+    "manoeuvres" exactly where the data ends. If `segment` is given, fits never
+    use samples from another track segment.
     """
     n = len(t)
     out = {k: np.full(n, np.nan) for k in ("val", "d1", "d2", "s_val", "s_d1", "s_d2", "chi2r")}
     out["n_used"] = np.zeros(n, int)
     idx_valid = np.flatnonzero(valid)
     tv, yv, sv = t[idx_valid], y[idx_valid], np.maximum(sigma[idx_valid], 1e-12)
+    segv = None if segment is None else np.asarray(segment)[idx_valid]
     m = order + 1
     for j, i in enumerate(idx_valid):
         lo = np.searchsorted(tv, t[i] - half_window - 1e-9)
         hi = np.searchsorted(tv, t[i] + half_window + 1e-9)
+        if segv is not None:
+            same = np.flatnonzero(segv[lo:hi] == segv[j])
+            lo, hi = lo + same[0], lo + same[-1] + 1
         if hi - lo < m + 1 or (j - lo) < min_side or (hi - 1 - j) < min_side:
             continue
         tau = tv[lo:hi] - t[i]
@@ -113,6 +118,50 @@ def random_walk_sigma(t: np.ndarray, step_sigma: np.ndarray, valid: np.ndarray,
     return s1, s2
 
 
+def detect_turns(t: np.ndarray, x: np.ndarray, y: np.ndarray, vx: np.ndarray, vy: np.ndarray, svx: np.ndarray,
+                 svy: np.ndarray, valid: np.ndarray, seg: np.ndarray, min_angle_deg: float = 45.0,
+                 span_s: float = 0.5) -> list[dict]:
+    """Heading changes of the path: compare the direction of motion span_s before and after each sample.
+
+    Only counted where the speed on both sides is > 3 sigma (a direction is meaningless for a near-stationary
+    object) and both sides lie in the same continuous track segment. Peaks above min_angle_deg, at least
+    2*span_s apart, are returned with the turn angle (0-180 deg).
+    """
+    idx = np.flatnonzero(valid & np.isfinite(vx) & np.isfinite(vy))
+    if len(idx) < 3:
+        return []
+    speed = np.hypot(vx, vy)
+    sig = np.hypot(svx, svy)
+    ang = np.full(len(t), np.nan)
+    for i in idx:
+        a = idx[(t[idx] <= t[i] - span_s) & (seg[idx] == seg[i])]
+        b = idx[(t[idx] >= t[i] + span_s) & (seg[idx] == seg[i])]
+        if not len(a) or not len(b):
+            continue
+        j, k = a[-1], b[0]
+        if speed[j] < 3 * sig[j] or speed[k] < 3 * sig[k]:
+            continue
+        h1, h2 = np.arctan2(vy[j], vx[j]), np.arctan2(vy[k], vx[k])
+        ang[i] = abs(np.degrees((h2 - h1 + np.pi) % (2 * np.pi) - np.pi))
+    # A sharp corner gives a plateau of equal values (every window straddling it sees the full turn): report
+    # the centre of the samples within 2 deg of each run's maximum.
+    out = []
+    above = np.isfinite(ang) & (ang >= min_angle_deg)
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], above.astype(int), [0]])))
+    for a, b in zip(edges[::2], edges[1::2]):
+        run = np.arange(a, b)
+        run = run[np.isfinite(ang[run])]
+        top = run[ang[run] >= ang[run].max() - 2.0]
+        i = int(top[len(top) // 2])
+        out.append(dict(t=float(t[i]), index=i, x=float(x[i]), y=float(y[i]), angle_deg=float(ang[run].max())))
+    out.sort(key=lambda o: -o["angle_deg"])
+    kept = []
+    for o in out:
+        if all(abs(o["t"] - k["t"]) >= 2 * span_s for k in kept):
+            kept.append(o)
+    return sorted(kept, key=lambda o: o["t"])
+
+
 def _mag(ax, ay, sx, sy):
     m = np.hypot(ax, ay)
     den = np.maximum(m, np.hypot(sx, sy))
@@ -132,6 +181,9 @@ class Kinematics:
     warnings: list = field(default_factory=list)
     f0_px: float = float("nan")
     trusted: Optional[np.ndarray] = None   # valid AND no low-confidence camera step inside the derivative window
+    turns: dict = field(default_factory=dict)   # "screen" / "compensated" -> list of turn dicts
+    name: str = ""
+    role: str = "target"
 
     def __post_init__(self):
         if self.trusted is None:
@@ -181,6 +233,17 @@ class Kinematics:
             vv = self.valid
             s["total_angular_travel_deg"] = float(np.nansum(np.hypot(
                 np.diff(self.get("los_x")[vv]), np.diff(self.get("los_y")[vv]))))
+        vv = self.valid
+        si = self.get("img_speed")
+        if np.isfinite(si[vv]).any():
+            s["screen_speed_median_px_s"] = float(np.nanmedian(si[vv]))
+            i = int(np.nanargmax(np.where(vv, si, np.nan)))
+            s["screen_speed_max_px_s"] = (float(si[i]), float(self.get("img_speed_sigma")[i]), int(self.frame[i]))
+        if "screen_omega" in self.cols and np.isfinite(self.get("screen_omega")[vv]).any():
+            w = self.get("screen_omega")
+            i = int(np.nanargmax(np.where(vv, w, np.nan)))
+            s["screen_omega_median_deg_s"] = float(np.nanmedian(w[vv]))
+            s["screen_omega_max_deg_s"] = (float(w[i]), float(self.get("screen_omega_sigma")[i]), int(self.frame[i]))
         s["n_frames_used"] = int(self.valid.sum())
         s["n_frames_trusted"] = int((v & np.isfinite(self.get("omega"))).sum()) if self.has_angles() else int(v.sum())
         tv = self.valid
@@ -189,22 +252,27 @@ class Kinematics:
 
 
 def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times: np.ndarray, duplicate: np.ndarray,
-                       shape: tuple[int, int], params: KinParams) -> Kinematics:
+                       shape: tuple[int, int], params: KinParams, frame_offset: int = 0,
+                       blank: Optional[np.ndarray] = None) -> Kinematics:
+    """Frame numbers (start/end, the 'frame' column) refer to the video file; the cache may hold a segment."""
     H, W = shape[:2]
     n = track.n
-    end = n - 1 if params.end_frame < 0 else min(params.end_frame, n - 1)
-    start = max(0, params.start_frame)
-    frames = np.arange(n)
-    in_range = (frames >= start) & (frames <= end)
+    frames = frame_offset + np.arange(n)
+    end = frames[-1] if params.end_frame < 0 else params.end_frame
+    in_range = (frames >= params.start_frame) & (frames <= end)
+    blank = np.zeros(n, bool) if blank is None else np.asarray(blank, bool)
+    duplicate = np.asarray(duplicate, bool) | blank
     t = np.asarray(frame_times, float)
     warnings: list[str] = []
 
     usable = track.usable() & in_range & ~duplicate
     flags = [[] for _ in range(n)]
     for k in range(n):
-        if duplicate[k]:
+        if blank[k]:
+            flags[k].append("BLANK_FRAME")
+        elif duplicate[k]:
             flags[k].append("DUPLICATE_FRAME")
-        if track.status[k] not in ("OK", "NONE"):
+        if track.status[k] not in ("OK", "NONE", "DUP", "BLANK"):
             flags[k].append(f"TRACK_{track.status[k]}")
 
     use_cam = camera is not None and params.use_camera
@@ -223,8 +291,8 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
         A = np.repeat(np.eye(3)[None], n, axis=0)
         conf = np.full(n, np.nan)
         cam_sig = np.zeros(n)
-        warnings.append("Camera motion NOT compensated: all apparent motion is attributed to the object. "
-                        "Only valid for a locked-off (static) camera.")
+        warnings.append("Camera motion NOT compensated: static camera ASSUMED. All on-screen motion is attributed "
+                        "to the object; every angular value below inherits this assumption.")
 
     if usable.sum() < max(params.poly_order + 2, 4):
         warnings.append("Too few usable tracked frames for derivatives.")
@@ -255,20 +323,28 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
     cols["stab_y"] = (Prov.MEASURED, "refpx", ref[:, 1])
 
     half = (max(params.window_frames, 3) - 1) / 2.0
-    dt_med = float(np.median(np.diff(t))) if n > 1 else 1.0
+    # The window counts NEW-CONTENT frames: with duplicates removed (e.g. 10 fps content in a 30 fps file) the
+    # sample spacing is that of the usable frames, not the container frame rate.
+    tu = t[usable]
+    dt_med = float(np.median(np.diff(tu))) if len(tu) > 2 else (float(np.median(np.diff(t))) if n > 1 else 1.0)
     hw = half * dt_med
     order = int(np.clip(params.poly_order, 1, 3))
     ms = max(1, int(half) // 2)
+    seg = segment_ids(track.status)
+    if seg.max() > 0:
+        warnings.append(f"Track has {seg.max() + 1} continuous segments (breaks at re-acquisitions or lost spans); "
+                        "derivatives are never fitted across a break.")
 
     # Raw on-screen motion (no camera compensation) - purely measured
     sig_raw = np.nan_to_num(track.sigma, nan=1.0)
-    fx = local_poly(t, px, sig_raw, usable, hw, order, ms)
-    fy = local_poly(t, py, sig_raw, usable, hw, order, ms)
-    v_img, _ = _mag(fx["d1"], fy["d1"], fx["s_d1"], fy["s_d1"])
+    fx = local_poly(t, px, sig_raw, usable, hw, order, ms, seg)
+    fy = local_poly(t, py, sig_raw, usable, hw, order, ms, seg)
+    v_img, sv_img = _mag(fx["d1"], fy["d1"], fx["s_d1"], fy["s_d1"])
     cols["img_speed"] = (Prov.MEASURED, "px_s", v_img)
+    cols["img_speed_sigma"] = (Prov.MEASURED, "px_s", sv_img)
     # Camera-compensated motion in reference pixels - measured (depends on registration only)
-    gx = local_poly(t, ref[:, 0], sig_px, usable, hw, order, ms)
-    gy = local_poly(t, ref[:, 1], sig_px, usable, hw, order, ms)
+    gx = local_poly(t, ref[:, 0], sig_px, usable, hw, order, ms, seg)
+    gy = local_poly(t, ref[:, 1], sig_px, usable, hw, order, ms, seg)
     rw1, rw2 = random_walk_sigma(t, cam_sig * scale, usable, hw) if use_cam else (np.zeros(n), np.zeros(n))
     for g in (gx, gy):
         g["s_d1"] = np.hypot(g["s_d1"], rw1)
@@ -291,8 +367,8 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
         th_x = th_cx + dxs * k_off
         th_y = th_cy + dys * k_off
         sig_th = sig_px / f0
-        ax = local_poly(t, th_x, sig_th, usable, hw, order, ms)
-        ay = local_poly(t, th_y, sig_th, usable, hw, order, ms)
+        ax = local_poly(t, th_x, sig_th, usable, hw, order, ms, seg)
+        ay = local_poly(t, th_y, sig_th, usable, hw, order, ms, seg)
         for g in (ax, ay):
             g["s_d1"] = np.hypot(g["s_d1"], rw1 / f0)
             g["s_d2"] = np.hypot(g["s_d2"], rw2 / f0)
@@ -316,6 +392,14 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
             s_n = np.hypot(ax["s_d2"], ay["s_d2"]) / np.sqrt(2) + a_m * w_s / np.maximum(wm, w_s)
             cols["alpha_lateral"] = (Prov.MEASURED_FOV, "deg_s2", D(a_n))
             cols["alpha_lateral_sigma"] = (Prov.MEASURED_FOV, "deg_s2", D(s_n))
+        # On-screen angular rate: image motion only, NOT corrected for camera motion. Equals the object's
+        # LOS rate only if the camera was not moving. Kept separate so the two are never confused.
+        cols["screen_omega"] = (Prov.MEASURED_FOV, "deg_s", D(v_img / f0))
+        cols["screen_omega_sigma"] = (Prov.MEASURED_FOV, "deg_s", D(sv_img / f0))
+        if order >= 2:
+            sa_m, sa_s = _mag(fx["d2"], fy["d2"], fx["s_d2"], fy["s_d2"])
+            cols["screen_alpha"] = (Prov.MEASURED_FOV, "deg_s2", D(sa_m / f0))
+            cols["screen_alpha_sigma"] = (Prov.MEASURED_FOV, "deg_s2", D(sa_s / f0))
         size_ref = track.size_px * scale
         cols["angular_size"] = (Prov.MEASURED_FOV, "deg", D(size_ref / f0))
         if use_cam:
@@ -329,6 +413,12 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
         cols["fit_chi2r"] = (Prov.MEASURED, "", np.fmax(gx["chi2r"], gy["chi2r"]))
 
     trusted = usable & np.isfinite(px)
+    if not use_cam:   # everything "camera-compensated" is really on-screen motion under a static-camera assumption
+        for name in ("stab_x", "stab_y", "stab_speed", "stab_speed_sigma", "los_x", "los_y", "omega_x", "omega_y",
+                     "omega", "omega_sigma", "alpha_x", "alpha_y", "alpha", "alpha_sigma", "alpha_lateral",
+                     "alpha_lateral_sigma"):
+            if name in cols:
+                cols[name] = (Prov.STATIC_CAM, cols[name][1], cols[name][2])
     if use_cam:
         low = usable & (conf < params.low_conf_threshold)
         if low.any():
@@ -345,9 +435,13 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
                             "derivative window; they are kept in the CSV (flagged) but excluded from peak/median "
                             "summaries and scenario tables.")
     if duplicate[in_range].any():
-        warnings.append(f"{int(duplicate[in_range].sum())} duplicate frames excluded from fits.")
+        warnings.append(f"{int((duplicate & ~blank)[in_range].sum())} duplicate and {int(blank[in_range].sum())} "
+                        "blank frames excluded from fits.")
     if abs(par - 1.0) > 1e-6:
         warnings.append(f"Non-square pixels (aspect {par:g}) applied to angles; camera roll estimation assumes "
                         "square pixels.")
+    turns = {"screen": detect_turns(t, px, py, fx["d1"], fy["d1"], fx["s_d1"], fy["s_d1"], usable, seg),
+             "compensated": detect_turns(t, ref[:, 0], ref[:, 1], gx["d1"], gy["d1"], gx["s_d1"], gy["s_d1"],
+                                         trusted, seg) if use_cam else []}
     return Kinematics(params=params, frame=frames, t=t, valid=usable & np.isfinite(px), flags=flags, cols=cols,
-                      warnings=warnings, f0_px=f0, trusted=trusted)
+                      warnings=warnings, f0_px=f0, trusted=trusted, turns=turns, name=track.name, role=track.role)

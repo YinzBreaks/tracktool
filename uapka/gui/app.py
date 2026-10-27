@@ -186,9 +186,22 @@ class MainWindow(QMainWindow):
     def _tab_video(self):
         w = QWidget()
         l = QVBoxLayout(w)
+        row = QHBoxLayout()
         b = QPushButton("Open video…")
         b.clicked.connect(self.open_video_dialog)
-        l.addWidget(b)
+        row.addWidget(b)
+        row.addWidget(QLabel("Segment (s):"))
+        self.sp_seg0 = QDoubleSpinBox(minimum=0, maximum=10**6, decimals=2, value=0.0)
+        self.sp_seg1 = QDoubleSpinBox(minimum=0, maximum=10**6, decimals=2, value=0.0)
+        self.sp_seg1.setToolTip("0 = to the end of the file")
+        row.addWidget(self.sp_seg0)
+        row.addWidget(QLabel("to"))
+        row.addWidget(self.sp_seg1)
+        b = QPushButton("Reload segment")
+        b.setToolTip("Re-decode only this part of the file (long videos: analyse the part you need)")
+        b.clicked.connect(lambda: self.p.video_path and self.open_video(self.p.video_path, keep_project=True))
+        row.addWidget(b)
+        l.addLayout(row)
         self.txt_meta = QPlainTextEdit(readOnly=True)
         l.addWidget(self.txt_meta, 1)
         l.addWidget(QLabel("Workflow: 2 mask overlays → 3 mark the object → Run full analysis (Ctrl+R) → "
@@ -230,6 +243,22 @@ class MainWindow(QMainWindow):
     def _tab_track(self):
         w = QWidget()
         l = QVBoxLayout(w)
+        g = QGroupBox("Objects")
+        gl = QHBoxLayout(g)
+        self.cmb_obj = QComboBox()
+        self.cmb_obj.currentIndexChanged.connect(self._select_object)
+        self.cmb_role = QComboBox()
+        self.cmb_role.addItems(["target", "control"])
+        self.cmb_role.setToolTip("control = a feature fixed to the background (cloud, coastline, surface feature). "
+                                 "Its camera-compensated motion should be zero, so it measures the compensation error.")
+        self.cmb_role.currentTextChanged.connect(self._set_role)
+        b_add = QPushButton("Add object")
+        b_add.clicked.connect(self._add_object)
+        b_del = QPushButton("Delete")
+        b_del.clicked.connect(self._delete_object)
+        for w_ in (self.cmb_obj, self.cmb_role, b_add, b_del):
+            gl.addWidget(w_)
+        l.addWidget(g)
         g = QGroupBox("Mark the object")
         gl = QVBoxLayout(g)
         self.btn_mark = QPushButton("Mark object: drag a box around it")
@@ -266,6 +295,14 @@ class MainWindow(QMainWindow):
         b = QPushButton("Remove keyframe here")
         b.clicked.connect(self._remove_keyframe)
         row.addWidget(b)
+        b = QPushButton("Start track here")
+        b.setToolTip("Do not track this object before the current frame (it appears or splits off here)")
+        b.clicked.connect(self._start_here)
+        row.addWidget(b)
+        b = QPushButton("End track here")
+        b.setToolTip("Stop tracking this object after the current frame (it leaves, splits or becomes ambiguous)")
+        b.clicked.connect(self._end_here)
+        row.addWidget(b)
         b = QPushButton("Toggle exclude frame")
         b.setToolTip("Mark this frame unusable (occlusion, glare, interlace tear). Excluded frames are skipped.")
         b.clicked.connect(self._toggle_exclude)
@@ -284,6 +321,12 @@ class MainWindow(QMainWindow):
         self.sp_tupd = QDoubleSpinBox(minimum=0.0, maximum=0.5, singleStep=0.01, value=tp.template_update)
         self.chk_centroid = QCheckBox(checked=tp.centroid_refine)
         self.chk_reacq = QCheckBox(checked=tp.reacquire)
+        self.cmb_tmode = QComboBox()
+        self.cmb_tmode.addItems(["auto", "point", "template"])
+        self.cmb_tmode.setToolTip("point: matched filter for objects of a few pixels; template: extended objects")
+        self.sp_snr = QDoubleSpinBox(minimum=2.0, maximum=50.0, singleStep=0.5, value=tp.snr_min)
+        f.addRow("Matching mode", self.cmb_tmode)
+        f.addRow("Point mode: min SNR", self.sp_snr)
         f.addRow("Search radius (px)", self.sp_radius)
         f.addRow("Lost threshold (NCC)", self.sp_lost)
         f.addRow("Template update rate", self.sp_tupd)
@@ -478,6 +521,8 @@ class MainWindow(QMainWindow):
         tp.template_update = self.sp_tupd.value()
         tp.centroid_refine = self.chk_centroid.isChecked()
         tp.reacquire = self.chk_reacq.isChecked()
+        tp.mode = self.cmb_tmode.currentText()
+        tp.snr_min = self.sp_snr.value()
         tp.polarity = self.cmb_pol.currentText()
         tp.preset = self.cmb_preset.currentText()
         cp = self.p.camera_params
@@ -511,6 +556,10 @@ class MainWindow(QMainWindow):
         self.sp_tupd.setValue(tp.template_update)
         self.chk_centroid.setChecked(tp.centroid_refine)
         self.chk_reacq.setChecked(tp.reacquire)
+        self.cmb_tmode.setCurrentText(tp.mode)
+        self.sp_snr.setValue(tp.snr_min)
+        self.sp_seg0.setValue(self.p.segment_start_s)
+        self.sp_seg1.setValue(self.p.segment_end_s)
         self.cmb_pol.setCurrentText(tp.polarity)
         self.cmb_preset.setCurrentText(tp.preset)
         self.cmb_fpn.setCurrentText(cp.fpn_mode)
@@ -568,7 +617,11 @@ class MainWindow(QMainWindow):
         if not keep_project:
             self.p = Project(camera_params=self.p.camera_params, track_params=self.p.track_params,
                              kin_params=self.p.kin_params, scenario=self.p.scenario)
+        elif self.p.cache is not None and (self.sp_seg0.value(), self.sp_seg1.value()) != \
+                (self.p.segment_start_s, self.p.segment_end_s):
+            self.p.tracks = []      # keyframes refer to the old segment's frame indices
         p = self.p
+        p.segment_start_s, p.segment_end_s = self.sp_seg0.value(), self.sp_seg1.value()
         self._run_job("Decoding video…", lambda prog, cancel: p.open_video(path, prog, cancel), self._video_opened)
 
     def _video_opened(self, warnings):
@@ -584,6 +637,7 @@ class MainWindow(QMainWindow):
         self.txt_meta.setPlainText("\n".join(lines))
         self._set_enabled(True)
         self._refresh_masks()
+        self._refresh_objects()
         self._refresh_track_info()
         self.goto(0)
         self.statusBar().showMessage(f"Loaded {os.path.basename(self.p.video_path)}: {n} frames", 8000)
@@ -634,6 +688,9 @@ class MainWindow(QMainWindow):
                     pts = ref @ Ak_inv[:2, :2].T + Ak_inv[:2, 2]
                 v.trail = pts
         v.candidates = [(c.x, c.y, f"#{i + 1}") for i, c in enumerate(self._candidates)] if self._cand_frame == k else []
+        v.others = [(t.x[k], t.y[k], f"{t.name}" + (" (control)" if t.role == "control" else ""))
+                    for i, t in enumerate(self.p.tracks)
+                    if i != self.p.active and t.status[k] not in ("NONE",) and np.isfinite(t.x[k])]
         v.update()
 
     _cand_frame = -1
@@ -734,6 +791,26 @@ class MainWindow(QMainWindow):
                 tr.reset_results()
                 self._update_overlays()
 
+    def _start_here(self):
+        tr = self.p.track
+        if tr is None:
+            return
+        tr.start = -1 if tr.start == self.k else self.k
+        self.statusBar().showMessage(f"{tr.name}: " + ("no start limit" if tr.start < 0 else
+                                                        f"starts at video frame {self.p.file_frame(tr.start)}"), 6000)
+        if tr.keyframes:
+            self.run_tracking(quiet=True)
+
+    def _end_here(self):
+        tr = self.p.track
+        if tr is None:
+            return
+        tr.end = -1 if tr.end == self.k else self.k
+        self.statusBar().showMessage(f"{tr.name}: " + ("no end limit" if tr.end < 0 else
+                                                        f"ends at video frame {self.p.file_frame(tr.end)}"), 6000)
+        if tr.keyframes:
+            self.run_tracking(quiet=True)
+
     def _toggle_exclude(self):
         tr = self.p.track
         if tr is None:
@@ -771,14 +848,67 @@ class MainWindow(QMainWindow):
             self.lbl_kf.setText("Keyframes: none")
             return
         kfs = sorted(tr.keyframes)
-        self.lbl_kf.setText(f"Keyframes (manual positions): {kfs if kfs else 'none'}   "
-                            f"Excluded frames: {sorted(tr.excluded) if tr.excluded else 'none'}")
+        ff = self.p.file_frame
+        self.lbl_kf.setText(f"[{tr.name}] keyframes (video frames): {[ff(k) for k in kfs] if kfs else 'none'}   "
+                            f"Excluded: {[ff(k) for k in sorted(tr.excluded)] if tr.excluded else 'none'}")
         sc = Counter(tr.status)
         if any(tr.status != "NONE"):
             self.lbl_track.setText("Status: " + ", ".join(f"{k} {v}" for k, v in sorted(sc.items())) +
                                    ". Red/yellow on the timeline = check those frames.")
         conf = self.p.camera.confidence() if self.p.camera is not None else None
         self.timeline.set_data(tr.n, tr.status, conf, kfs)
+
+    # ---------------------------------------------------------------- objects
+    def _refresh_objects(self):
+        self.cmb_obj.blockSignals(True)
+        self.cmb_obj.clear()
+        for t in self.p.tracks:
+            self.cmb_obj.addItem(f"{t.name} ({t.role})")
+        self.cmb_obj.setCurrentIndex(self.p.active)
+        self.cmb_obj.blockSignals(False)
+        self.cmb_role.blockSignals(True)
+        if self.p.track is not None:
+            self.cmb_role.setCurrentText(self.p.track.role)
+        self.cmb_role.blockSignals(False)
+
+    def _select_object(self, i: int):
+        if 0 <= i < len(self.p.tracks):
+            self.p.active = i
+            self._refresh_objects()
+            self._refresh_track_info()
+            if self.p.kin is not None:
+                self._show_kin()
+            self.goto(self.k)
+
+    def _add_object(self):
+        if self.p.cache is None:
+            return
+        names = {t.name for t in self.p.tracks}
+        i = len(self.p.tracks) + 1
+        while f"obj{i}" in names:
+            i += 1
+        self.p.add_track(f"obj{i}", self.cmb_role.currentText())
+        self.p.active = len(self.p.tracks) - 1
+        self.p.kins = []
+        self._refresh_objects()
+        self._refresh_track_info()
+        self.btn_mark.setChecked(True)
+        self.statusBar().showMessage(f"Added obj{i}: drag a box around it.", 8000)
+
+    def _delete_object(self):
+        if len(self.p.tracks) <= 1:
+            return
+        del self.p.tracks[self.p.active]
+        self.p.active = 0
+        self.p.kins = []
+        self._refresh_objects()
+        self._refresh_track_info()
+        self.goto(self.k)
+
+    def _set_role(self, role: str):
+        if self.p.track is not None:
+            self.p.track.role = role
+            self._refresh_objects()
 
     def _invalidate(self, camera: bool = False):
         if camera:
@@ -792,7 +922,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Track", "Mark the object first (Track tab).")
             return
         p = self.p
-        self._run_job("Tracking…", lambda prog, cancel: p.run_tracking(prog, cancel), self._after_track)
+        self._run_job("Tracking…", lambda prog, cancel: p.run_tracking(prog, cancel, only_active=quiet),
+                      self._after_track)
 
     def _after_track(self, _):
         self._refresh_track_info()
@@ -861,7 +992,7 @@ class MainWindow(QMainWindow):
         if kin is None:
             return
         s = kin.summary()
-        lines = [f"Frames used: {s['n_frames_used']} over {s['duration_used_s']:.3f} s; "
+        lines = [f"[{kin.name}, {kin.role}] Frames used: {s['n_frames_used']} over {s['duration_used_s']:.3f} s; "
                  f"{s['n_frames_trusted']} with trusted camera motion feed the statistics [MEASURED]"]
         if kin.has_angles() and "omega_median_deg_s" in s:
             v, sg, fr = s["omega_max_deg_s"]
@@ -872,11 +1003,21 @@ class MainWindow(QMainWindow):
                 lines.append(f"Angular acceleration peak {v:.4g} ± {sg:.2g} deg/s² at frame {fr}; noise floor "
                              f"{s['alpha_noise_floor_deg_s2']:.3g} deg/s² [MEASURED+FOV]")
             lines.append(f"Total angular travel {s['total_angular_travel_deg']:.4g} deg [MEASURED+FOV]")
+        if "screen_speed_median_px_s" in s:
+            v, sg, fr = s["screen_speed_max_px_s"]
+            lines.append(f"On-screen speed (NOT camera-compensated) median {s['screen_speed_median_px_s']:.4g} px/s, "
+                         f"peak {v:.4g} ± {sg:.2g} px/s [MEASURED]")
+        turns = kin.turns.get("screen", [])
+        if turns:
+            lines.append("On-screen turns: " + ", ".join(f"{t['angle_deg']:.0f}°@{t['t']:.1f}s" for t in turns))
+            lines.append("Camera-compensated turns: " + (", ".join(f"{t['angle_deg']:.0f}°@{t['t']:.1f}s"
+                                                                   for t in kin.turns.get("compensated", [])) or "none"))
         lines += [f"⚠ {w}" for w in kin.warnings]
         self.txt_kin.setPlainText("\n".join(lines))
         from ..plots import kinematics_figure, path_figure
-        self.fig_kin.set_figure(kinematics_figure(kin))
-        self.fig_path.set_figure(path_figure(kin, self.p.cache[0]))
+        controls = [k for k in self.p.kins if k is not None and k.role == "control"]
+        self.fig_kin.set_figure(kinematics_figure(kin, controls))
+        self.fig_path.set_figure(path_figure(self.p.kins, self.p.cache[0], self.p.active))
 
     def _scen_mode_changed(self, mode):
         self.lbl_values.setText({"range": "Slant ranges", "size": "Object sizes", "altitude": "Object altitudes"}[mode])

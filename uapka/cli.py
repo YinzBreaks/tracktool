@@ -80,15 +80,71 @@ def cmd_analyze(a) -> int:
                                       elevation_deg=a.elevation or 0.0)
         p.scenario.observer_vx_ms, p.scenario.observer_vy_ms = a.observer_v or (0.0, 0.0)
 
+    if a.start is not None:
+        p.segment_start_s = a.start
+    if a.end is not None:
+        p.segment_end_s = a.end
+    if a.mode:
+        p.track_params.mode = a.mode
+    if a.polarity:
+        p.track_params.polarity = a.polarity
+    if a.snr_min is not None:
+        p.track_params.snr_min = a.snr_min
+    if a.search_radius is not None:
+        p.track_params.search_radius_px = a.search_radius
     for w in p.open_video(a.video, progress=_progress):
         print("WARNING:", w, file=sys.stderr)
     if a.auto_masks:
         sugg, msg = suggest_static_overlays(p.cache.frames)
         print(msg, file=sys.stderr)
         p.masks += sugg
-    if a.roi:
-        cx, cy, w, h = _parse_box(a.roi)
-        p.track.keyframes[a.frame] = (cx, cy, w, h)
+    specs = [(None, r) for r in (a.roi or [])]
+    for spec in a.track or []:
+        name, _, rest = spec.partition("=")
+        specs.append((name, rest))
+    for name, roi in specs:
+        t = p.track
+        if name:
+            nm, _, role = name.partition("/")
+            role = role or "target"
+            t = p.get_track(nm)
+            if t is None:
+                if len(p.tracks) == 1 and not p.tracks[0].keyframes and p.tracks[0].name == "obj1":
+                    t = p.tracks[0]
+                    t.name, t.role = nm, role
+                else:
+                    t = p.add_track(nm, role)
+        box, at = roi.split("@", 1) if "@" in roi else (roi, None)
+        cx, cy, w, h = _parse_box(box)
+        frame = a.frame if at is None else int(round(float(at) * p.meta.fps))
+        k = p.cache_index(frame)
+        if not 0 <= k < len(p.cache):
+            print(f"ERROR: frame {frame} is outside the analysed segment", file=sys.stderr)
+            return 2
+        t.keyframes[k] = (cx, cy, w, h)
+    for spec in a.exclude or []:
+        nm, _, rng = spec.partition("@")
+        t = p.get_track(nm)
+        if t is None:
+            print(f"ERROR: --exclude: no object named {nm!r}", file=sys.stderr)
+            return 2
+        t0, _, t1 = rng.partition(":")
+        k0, k1 = (p.cache_index(int(round(float(x) * p.meta.fps))) for x in (t0, t1 or t0))
+        t.excluded |= set(range(max(0, k0), min(len(p.cache), k1 + 1)))
+    for attr, specs_ in (("end", a.track_end), ("start", a.track_start)):
+        for spec in specs_ or []:
+            nm, _, at = spec.partition("@")
+            t = p.get_track(nm)
+            if t is None:
+                print(f"ERROR: --track-{attr}: no object named {nm!r}", file=sys.stderr)
+                return 2
+            setattr(t, attr, p.cache_index(int(round(float(at) * p.meta.fps))))
+    if a.active:
+        names = [t.name for t in p.tracks]
+        if a.active not in names:
+            print(f"ERROR: --active {a.active!r} is not one of {names}", file=sys.stderr)
+            return 2
+        p.active = names.index(a.active)
     if not p.track.keyframes:
         print("ERROR: give the object position with --roi CX,CY,W,H (centre and box size) at --frame N", file=sys.stderr)
         return 2
@@ -143,8 +199,25 @@ def main(argv=None) -> int:
     z.add_argument("video")
     z.add_argument("--out", required=True, help="output folder")
     z.add_argument("--project", help="load settings/masks/keyframes from a project.json")
-    z.add_argument("--roi", help="object centre and box: CX,CY,W,H")
-    z.add_argument("--frame", type=int, default=0, help="frame index of --roi")
+    z.add_argument("--roi", action="append",
+                   help="object centre and box CX,CY,W,H (at --frame), or CX,CY,W,H@SECONDS; repeat for corrections")
+    z.add_argument("--frame", type=int, default=0, help="video frame number of a --roi without @SECONDS")
+    z.add_argument("--track", action="append", metavar="NAME[/control]=CX,CY,W,H@SECONDS",
+                   help="keyframe for a named object (repeatable; '/control' marks a background feature used to "
+                        "measure camera-compensation error)")
+    z.add_argument("--track-start", action="append", metavar="NAME@SECONDS",
+                   help="do not track an object before this time (it appears, or splits off, here)")
+    z.add_argument("--track-end", action="append", metavar="NAME@SECONDS",
+                   help="stop tracking an object at this time (it leaves the frame, splits, or is lost)")
+    z.add_argument("--exclude", action="append", metavar="NAME@T0:T1",
+                   help="mark an object's frames in [T0, T1] s unusable (occlusion, crossing clutter)")
+    z.add_argument("--active", help="name of the target object that drives the summary and scenario table")
+    z.add_argument("--start", type=float, help="segment start (s) - analyse only part of the file")
+    z.add_argument("--end", type=float, help="segment end (s)")
+    z.add_argument("--mode", choices=["auto", "template", "point"], help="tracker mode")
+    z.add_argument("--polarity", choices=["auto", "bright", "dark"])
+    z.add_argument("--snr-min", type=float, help="point mode detection threshold (default 4)")
+    z.add_argument("--search-radius", type=int, help="tracker search radius in px")
     z.add_argument("--hfov", type=float, help="horizontal field of view in degrees at the reference frame")
     z.add_argument("--par", type=float, help="pixel aspect ratio (width/height)")
     z.add_argument("--window", type=int, help="derivative window in frames")
