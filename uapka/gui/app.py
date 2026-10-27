@@ -9,11 +9,11 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QFont, QKeySequence
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+                               QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QTabWidget,
-                               QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
+                               QTableWidget, QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
 from ..detect import PRESETS, detect_blobs
@@ -22,11 +22,57 @@ from ..project import Project
 from ..provenance import ERROR_SOURCES
 from ..scenarios import ScenarioSpec, rows_table
 from ..tracker import TrackParams
-from . import worker
+from . import theme, worker
 from .frameview import FrameView
 from .timeline import Timeline
 
 VIDEO_FILTER = "Video files (*.mp4 *.mov *.avi *.mkv *.m4v *.wmv *.mpg *.mpeg *.ts *.webm);;All files (*)"
+
+
+def _hint(text: str) -> QLabel:
+    """Secondary explanatory text."""
+    lbl = QLabel(text)
+    lbl.setObjectName("hint")
+    lbl.setWordWrap(True)
+    return lbl
+
+
+def _readout(max_height: int) -> QTextEdit:
+    """Read-only results text in which provenance labels are colour-coded (see theme.provenance_html)."""
+    w = QTextEdit(readOnly=True)
+    w.setMaximumHeight(max_height)
+    w.setProperty("raw", "")
+    return w
+
+
+def _set_readout(w: QTextEdit, text: str):
+    w.setProperty("raw", text)
+    w.setHtml(theme.provenance_html(text))
+
+
+def _provenance_legend() -> QWidget:
+    """Always-visible key for the three labels, in the same colours used everywhere else."""
+    box = QWidget()
+    lay = QHBoxLayout(box)
+    lay.setContentsMargins(0, 0, 8, 0)
+    lay.setSpacing(10)
+    box.labels = []
+    for label, tip in theme.PROVENANCE_HELP.items():
+        lbl = QLabel()
+        lbl.setToolTip(f"{label}: {tip}")
+        lbl.setProperty("prov", label)
+        lay.addWidget(lbl)
+        box.labels.append(lbl)
+    _paint_legend(box)
+    return box
+
+
+def _paint_legend(box: QWidget):
+    for lbl in box.labels:
+        label = lbl.property("prov")
+        style = "font-style:italic;" if label == "ASSUMED" else ""
+        lbl.setText(f'<span style="color:{theme.provenance_color(label).name()}; font-weight:600; {style}">'
+                    f"■ {label}</span>")
 
 
 def _canvas(fig):
@@ -58,6 +104,7 @@ class FigureHolder(QWidget):
 
     def set_figure(self, fig):
         self.fig = fig
+        theme.restyle_figure(fig)
         self.scroll.setWidget(_canvas(fig))
         self.btn.setEnabled(True)
 
@@ -75,6 +122,10 @@ class FigureHolder(QWidget):
         dlg.resize(int(w * 1.1), int(h * 1.1) + 40)
         dlg.finished.connect(lambda _: self.set_figure(self.fig))
         dlg.show()
+
+    def restyle(self):
+        if self.fig is not None:
+            self.set_figure(self.fig)
 
 
 class MainWindow(QMainWindow):
@@ -99,6 +150,8 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal)
         left = QWidget()
         ll = QVBoxLayout(left)
+        ll.setContentsMargins(6, 6, 4, 6)
+        ll.setSpacing(6)
         self.view = FrameView()
         self.view.roiSelected.connect(self._on_roi)
         self.view.maskDrawn.connect(self._on_mask_drawn)
@@ -109,21 +162,27 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.timeline)
         row = QHBoxLayout()
         self.btn_prev = QToolButton(text="◀")
+        self.btn_prev.setToolTip("Previous frame (← / A / ,)")
         self.btn_prev.clicked.connect(lambda: self.goto(self.k - 1))
         self.btn_play = QToolButton(text="▶")
+        self.btn_play.setToolTip("Play / pause (Space)")
         self.btn_play.clicked.connect(self._toggle_play)
         self.btn_next = QToolButton(text="▶|")
+        self.btn_next.setToolTip("Next frame (→ / D / .)")
         self.btn_next.clicked.connect(lambda: self.goto(self.k + 1))
         self.slider = QSlider(Qt.Horizontal)
         self.slider.valueChanged.connect(self.goto)
         self.spin_frame = QSpinBox()
+        self.spin_frame.setFont(theme.mono_font())
         self.spin_frame.valueChanged.connect(self.goto)
         self.lbl_time = QLabel("–")
-        self.lbl_time.setMinimumWidth(260)
+        self.lbl_time.setObjectName("readout")
+        self.lbl_time.setMinimumWidth(300)
         self.chk_enh = QCheckBox("Enhance")
         self.chk_enh.setToolTip("Contrast-stretch the display (does not affect analysis)")
         self.chk_enh.toggled.connect(lambda _: self.goto(self.k))
         for w in (self.btn_prev, self.btn_play, self.btn_next):
+            w.setObjectName("transport")
             row.addWidget(w)
         row.addWidget(self.slider, 1)
         row.addWidget(self.spin_frame)
@@ -133,6 +192,8 @@ class MainWindow(QMainWindow):
         split.addWidget(left)
 
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("workflow")
+        self.tabs.setDocumentMode(False)
         self.tabs.addTab(self._tab_video(), "1 Video")
         self.tabs.addTab(self._tab_masks(), "2 Masks")
         self.tabs.addTab(self._tab_track(), "3 Track")
@@ -152,6 +213,8 @@ class MainWindow(QMainWindow):
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setVisible(False)
         self.btn_cancel.clicked.connect(lambda: self.job and self.job.cancel())
+        self.legend = _provenance_legend()
+        sb.addPermanentWidget(self.legend)
         sb.addPermanentWidget(self.progress)
         sb.addPermanentWidget(self.btn_cancel)
 
@@ -178,6 +241,15 @@ class MainWindow(QMainWindow):
         a.setShortcut("Ctrl+R")
         a.triggered.connect(self.run_all)
         m.addAction(a)
+        m = self.menuBar().addMenu("&View")
+        grp = QActionGroup(self)
+        self.theme_actions = {}
+        for key, text in (("dark", "Dark theme"), ("light", "Light theme (projector)")):
+            a = QAction(text, self, checkable=True, checked=theme.name() == key)
+            a.triggered.connect(lambda _=False, k=key: self.set_theme(k))
+            grp.addAction(a)
+            m.addAction(a)
+            self.theme_actions[key] = a
         m = self.menuBar().addMenu("&Help")
         a = QAction("Method and labels…", self)
         a.triggered.connect(self._help)
@@ -204,9 +276,10 @@ class MainWindow(QMainWindow):
         l.addLayout(row)
         self.txt_meta = QPlainTextEdit(readOnly=True)
         l.addWidget(self.txt_meta, 1)
-        l.addWidget(QLabel("Workflow: 2 mask overlays → 3 mark the object → Run full analysis (Ctrl+R) → "
-                           "5 enter the FOV → 6 scenario assumptions → 7 export."))
+        l.addWidget(_hint("Workflow: 2 mask overlays → 3 mark the object → Run full analysis (Ctrl+R) → "
+                          "5 enter the FOV → 6 scenario assumptions → 7 export."))
         self.btn_run = QPushButton("Run full analysis (track → camera → re-track → kinematics)")
+        self.btn_run.setObjectName("primary")
         self.btn_run.clicked.connect(self.run_all)
         l.addWidget(self.btn_run)
         return w
@@ -214,8 +287,8 @@ class MainWindow(QMainWindow):
     def _tab_masks(self):
         w = QWidget()
         l = QVBoxLayout(w)
-        l.addWidget(QLabel("Masked regions are ignored by camera registration and blob detection, and neutralised "
-                           "inside tracking templates. Mask HUD text, reticles, watermarks and redaction blocks."))
+        l.addWidget(_hint("Masked regions are ignored by camera registration and blob detection, and neutralised "
+                          "inside tracking templates. Mask HUD text, reticles, watermarks and redaction blocks."))
         row = QHBoxLayout()
         self.cmb_mask_kind = QComboBox()
         self.cmb_mask_kind.addItems(MASK_KINDS)
@@ -345,8 +418,8 @@ class MainWindow(QMainWindow):
     def _tab_camera(self):
         w = QWidget()
         l = QVBoxLayout(w)
-        l.addWidget(QLabel("Background registration estimates pan/tilt/roll/zoom between frames. Fixed-pattern "
-                           "noise is removed first so registration cannot lock onto the sensor."))
+        l.addWidget(_hint("Background registration estimates pan/tilt/roll/zoom between frames. Fixed-pattern "
+                          "noise is removed first so registration cannot lock onto the sensor."))
         g = QGroupBox("Parameters")
         f = QFormLayout(g)
         cp = self.p.camera_params
@@ -370,8 +443,7 @@ class MainWindow(QMainWindow):
         b = QPushButton("Estimate camera motion")
         b.clicked.connect(self.run_camera)
         l.addWidget(b)
-        self.txt_cam = QPlainTextEdit(readOnly=True)
-        self.txt_cam.setMaximumHeight(200)
+        self.txt_cam = _readout(200)
         l.addWidget(self.txt_cam)
         self.fig_cam = FigureHolder("Camera-motion confidence appears here")
         l.addWidget(self.fig_cam, 1)
@@ -408,8 +480,7 @@ class MainWindow(QMainWindow):
         b = QPushButton("Compute kinematics")
         b.clicked.connect(self.run_kinematics)
         l.addWidget(b)
-        self.txt_kin = QPlainTextEdit(readOnly=True)
-        self.txt_kin.setMaximumHeight(180)
+        self.txt_kin = _readout(180)
         l.addWidget(self.txt_kin)
         sub = QTabWidget()
         self.fig_kin = FigureHolder("Angular velocity / acceleration plots appear here")
@@ -427,7 +498,12 @@ class MainWindow(QMainWindow):
                      "Lists: <code>1km, 5km, 10nmi</code>; sweeps: <code>2km:40km:2km</code> or "
                      "<code>log:1km:100km:9</code>.")
         lab.setWordWrap(True)
-        l.addWidget(lab)
+        banner = QFrame()
+        banner.setObjectName("assumedBanner")
+        bl = QVBoxLayout(banner)
+        bl.setContentsMargins(10, 8, 10, 8)
+        bl.addWidget(lab)
+        l.addWidget(banner)
         g = QGroupBox("Assumption")
         f = QFormLayout(g)
         sp = self.p.scenario
@@ -452,8 +528,7 @@ class MainWindow(QMainWindow):
         l.addWidget(b)
         self.tbl_scen = QTableWidget()
         l.addWidget(self.tbl_scen, 1)
-        self.txt_scen = QPlainTextEdit(readOnly=True)
-        self.txt_scen.setMaximumHeight(110)
+        self.txt_scen = _readout(110)
         l.addWidget(self.txt_scen)
         self.fig_sweep = FigureHolder("Speed and g versus assumed range appear here")
         l.addWidget(self.fig_sweep, 1)
@@ -462,9 +537,9 @@ class MainWindow(QMainWindow):
     def _tab_export(self):
         w = QWidget()
         l = QVBoxLayout(w)
-        l.addWidget(QLabel("Writes: annotated video, per-frame CSV (every column tagged MEASURED / MEASURED+FOV / "
-                           "ASSUMED), scenario CSVs, path and rate plots, report (Markdown + self-contained HTML), "
-                           "and the project file for reproduction."))
+        l.addWidget(_hint("Writes: annotated video, per-frame CSV (every column tagged MEASURED / MEASURED+FOV / "
+                          "ASSUMED), scenario CSVs, path and rate plots, report (Markdown + self-contained HTML), "
+                          "and the project file for reproduction."))
         self.chk_vid = QCheckBox("Annotated video", checked=True)
         l.addWidget(self.chk_vid)
         b = QPushButton("Export all…")
@@ -959,7 +1034,7 @@ class MainWindow(QMainWindow):
         if fc.get("RAW_PHASECORR_LOCKED_TO_SENSOR"):
             lines.append("→ Naive phase correlation on raw frames would have reported ~zero camera motion in "
                          f"{fc['RAW_PHASECORR_LOCKED_TO_SENSOR']} frame pairs (fixed-pattern-noise lock).")
-        self.txt_cam.setPlainText("\n".join(lines))
+        _set_readout(self.txt_cam, "\n".join(lines))
         from ..plots import _clean, _fig, C1, C2, TEXT2
         fig = _fig(6, 2.6)
         ax1, ax2 = fig.subplots(2, 1, sharex=True)
@@ -1013,7 +1088,7 @@ class MainWindow(QMainWindow):
             lines.append("Camera-compensated turns: " + (", ".join(f"{t['angle_deg']:.0f}°@{t['t']:.1f}s"
                                                                    for t in kin.turns.get("compensated", [])) or "none"))
         lines += [f"⚠ {w}" for w in kin.warnings]
-        self.txt_kin.setPlainText("\n".join(lines))
+        _set_readout(self.txt_kin, "\n".join(lines))
         from ..plots import kinematics_figure, path_figure
         controls = [k for k in self.p.kins if k is not None and k.role == "control"]
         self.fig_kin.set_figure(kinematics_figure(kin, controls))
@@ -1049,11 +1124,25 @@ class MainWindow(QMainWindow):
         self.tbl_scen.setColumnCount(len(header))
         self.tbl_scen.setRowCount(len(rows))
         self.tbl_scen.setHorizontalHeaderLabels([h.replace(" [ASSUMED]", "\n[ASSUMED]") for h in header])
+        assumed = [h.endswith("[ASSUMED]") or h == "assumption" for h in header]
+        col, brush = theme.provenance_color("ASSUMED"), theme.assumed_brush()
+        italic = QFont(self.tbl_scen.font())
+        italic.setItalic(True)
+        for j, a in enumerate(assumed):
+            if a:
+                self.tbl_scen.horizontalHeaderItem(j).setForeground(col)
         for i, r in enumerate(rows):
             for j, v in enumerate(r):
-                self.tbl_scen.setItem(i, j, QTableWidgetItem(v))
+                item = QTableWidgetItem(v)
+                if assumed[j]:   # ASSUMED values look visibly softer than measurements
+                    item.setForeground(col)
+                    item.setBackground(brush)
+                    item.setFont(italic)
+                elif v.startswith("NO"):
+                    item.setForeground(theme.provenance_color("ASSUMED"))
+                self.tbl_scen.setItem(i, j, item)
         self.tbl_scen.resizeColumnsToContents()
-        self.txt_scen.setPlainText("\n".join(res.notes))
+        _set_readout(self.txt_scen, "\n".join(res.notes))
         from ..plots import sweep_figure
         self.fig_sweep.set_figure(sweep_figure(res))
 
@@ -1177,6 +1266,20 @@ class MainWindow(QMainWindow):
                + "</ul>")
         QMessageBox.about(self, "Method and labels", txt)
 
+    def set_theme(self, name: str):
+        theme.apply(QApplication.instance(), name)
+        theme.save_name(theme.name())
+        self.theme_actions[theme.name()].setChecked(True)
+        _paint_legend(self.legend)
+        for w in (self.txt_cam, self.txt_kin, self.txt_scen):
+            if w.property("raw"):
+                _set_readout(w, w.property("raw"))
+        for f in (self.fig_cam, self.fig_kin, self.fig_path, self.fig_sweep):
+            f.restyle()
+        self._show_scen()
+        self.view.update()
+        self.timeline.update()
+
     def closeEvent(self, ev):
         if self.job is not None:
             self.job.cancel()
@@ -1188,6 +1291,7 @@ class MainWindow(QMainWindow):
 def main(path: Optional[str] = None) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("UAP Kinematics Analyzer")
+    theme.apply(app, theme.saved_name())
     w = MainWindow()
     w.show()
     if path:

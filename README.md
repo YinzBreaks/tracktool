@@ -107,6 +107,13 @@ Single-folder executable: `pip install pyinstaller` then
    and `project.json`. The project file records masks, keyframes, every parameter and the video's
    SHA-256 so the analysis can be reproduced and checked.
 
+**Display.** *View* switches between a dark theme (default) and a light theme for classroom
+projectors. The app remembers your choice. In both themes, colour is kept for meaning:
+**MEASURED** is green, **MEASURED+FOV** is blue and **ASSUMED** is amber, and these colours match the
+status-bar key, the results readouts and the scenario table. ASSUMED values are also drawn italic
+and hatched so they never look like measurements. The theme changes only the screen. Exported
+plots and reports keep their light print style.
+
 ## CLI (headless, scriptable)
 
 ```bash
