@@ -84,10 +84,13 @@ def _parse_geo(s: str) -> tuple[float, float, float]:
 
 
 def cmd_fov(a) -> int:
-    from .fov import estimate_geo, estimate_hud, estimate_separation, estimate_size, save_fov_json
+    from .fov import estimate_geo, estimate_ground, estimate_hud, estimate_separation, estimate_size, save_fov_json
     from .units import parse_length
-    common = dict(width=a.width, height=a.height, pixel_aspect=a.par, frame=a.frame)
     try:
+        region = _parse_box(a.region) if a.region else None
+        if region is not None and len(region) != 4:
+            raise ValueError("--region takes X0,Y0,W,H (full-frame pixels)")
+        common = dict(width=a.width, height=a.height, pixel_aspect=a.par, frame=a.frame, region=region)
         if a.method == "separation":
             est = estimate_separation(p1=_parse_point(a.p1), p2=_parse_point(a.p2), angle_deg=a.angle,
                                       angle_sigma_deg=a.angle_sigma, click_sigma_px=a.click_sigma, **common)
@@ -102,6 +105,13 @@ def cmd_fov(a) -> int:
                 lms.append((_parse_point(px), _parse_geo(geo)))
             est = estimate_geo(camera=_parse_geo(a.camera), landmarks=lms, camera_sigma_m=parse_length(a.camera_sigma),
                                landmark_sigma_m=parse_length(a.landmark_sigma), click_sigma_px=a.click_sigma, **common)
+        elif a.method == "ground":
+            pts = []
+            for spec in a.point:
+                px, _, geo = spec.partition("=")
+                pts.append((_parse_point(px), _parse_geo(geo)))
+            est = estimate_ground(points=pts, point_sigma_m=parse_length(a.point_sigma), click_sigma_px=a.click_sigma,
+                                  **common)
         else:
             if a.table_json:
                 with open(a.table_json, encoding="utf-8") as f:
@@ -116,6 +126,12 @@ def cmd_fov(a) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     print(est.summary())
+    if a.method == "ground":
+        d = est.diagnostics
+        print(f"  camera ({d['camera_lat']:.6f}, {d['camera_lon']:.6f}, {d['camera_alt_m']:.1f} m), slant range "
+              f"{d['slant_range_m']:.1f} ± {d['slant_range_sigma_m']:.2g} m, elevation {d['elevation_deg']:.2f} deg, "
+              f"{d['ground_sample_m_per_px']:.4g} ± {d['ground_sample_sigma_m_per_px']:.2g} m/px at the image centre"
+              + ("" if d["hfov_determined"] else "  [HFOV/position NOT determined, see notes]"))
     for n in est.notes:
         print(f"  note: {n}")
     if a.save:
@@ -365,6 +381,10 @@ def main(argv=None) -> int:
     fc.add_argument("--par", type=float, default=1.0, help="pixel aspect ratio (width/height)")
     fc.add_argument("--click-sigma", type=float, default=1.0, help="uncertainty of each clicked point in px (default 1)")
     fc.add_argument("--frame", type=int, help="video frame the points were clicked on (recorded only)")
+    fc.add_argument("--region", metavar="X0,Y0,W,H",
+                    help="active image region (inset) in full-frame px when the sensor image sits inside a larger "
+                         "frame with side panels; the result is the HFOV of the inset and is applied with the same "
+                         "region (kin_params.image_region)")
     fc.add_argument("--save", metavar="FILE.json", help="append the estimate to this JSON file (for analyze --fov-json)")
     fm = fv.add_subparsers(dest="method", required=True)
     fs = fm.add_parser("separation", parents=[fc], help="two points with a KNOWN angle between them")
@@ -385,6 +405,12 @@ def main(argv=None) -> int:
                     help="pixel position = coordinates of a landmark (repeat; >= 3 gives a consistency check)")
     fg.add_argument("--camera-sigma", default="0", help="1-sigma of the camera position per axis, e.g. 200m")
     fg.add_argument("--landmark-sigma", default="0", help="1-sigma of each landmark position per axis, e.g. 50m")
+    fr = fm.add_parser("ground", parents=[fc],
+                       help="look-down footage, camera position unknown: >= 4 ground points of known position")
+    fr.add_argument("--point", action="append", required=True, metavar="X,Y=LAT,LON,ALT",
+                    help="pixel position = coordinates of a ground feature (repeat >= 4 times; 5-6 spread over the "
+                         "frame give a consistency check)")
+    fr.add_argument("--point-sigma", default="0", help="1-sigma of each ground point position per axis, e.g. 3m")
     fh = fm.add_parser("hud", parents=[fc], help="look a HUD zoom/FOV label up in a user-supplied table")
     fh.add_argument("--label", required=True, help="the HUD label, e.g. NAR")
     fh.add_argument("--table", help="LABEL=HFOV_DEG,... e.g. 'NAR=0.7,WFOV=2.5'")

@@ -38,6 +38,37 @@ class KinParams:
     end_frame: int = -1            # inclusive; -1 = last
     use_camera: bool = True
     low_conf_threshold: float = 0.3
+    # Active image region [x0, y0, w, h] (full-frame px) when the live sensor image is an inset in a larger frame
+    # (side/top panels). hfov_deg then refers to the inset WIDTH and the principal point is the inset centre.
+    # None = the whole frame. Set by Project.apply_fov from a derived-FOV estimate made with a region.
+    image_region: Optional[list] = None
+
+    def __post_init__(self):
+        if self.image_region is not None:
+            try:
+                reg = [float(v) for v in self.image_region]
+            except (TypeError, ValueError):
+                raise ValueError("image_region must be [x0, y0, w, h] in full-frame pixels") from None
+            if len(reg) != 4 or reg[2] <= 0 or reg[3] <= 0:
+                raise ValueError("image_region must be [x0, y0, w, h] with a positive width and height")
+            self.image_region = reg
+
+    def principal_point(self, width: int, height: int) -> tuple[float, float]:
+        """Pinhole principal point (px): the inset centre when image_region is set, else the frame centre."""
+        if self.image_region:
+            x0, y0, w, h = self.image_region
+            return x0 + w / 2.0, y0 + h / 2.0
+        return width / 2.0, height / 2.0
+
+    def fov_width(self, width: int) -> float:
+        """The width hfov_deg refers to (inset width when image_region is set, else the frame width)."""
+        return float(self.image_region[2]) if self.image_region else float(width)
+
+    def focal_px(self, width: int) -> float:
+        """Focal length in px for hfov_deg (NaN when the HFOV is unknown). Same formula as fov.focal_px."""
+        if not self.hfov_deg or self.hfov_deg <= 0:
+            return float("nan")
+        return (self.fov_width(width) / 2.0) / float(np.tan(np.radians(self.hfov_deg) / 2.0))
 
 
 def local_poly(t: np.ndarray, y: np.ndarray, sigma: np.ndarray, valid: np.ndarray, half_window: float,
@@ -300,8 +331,13 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
     if usable.sum() < max(params.poly_order + 2, 4):
         warnings.append("Too few usable tracked frames for derivatives.")
 
-    c = np.array([W / 2.0, H / 2.0])
+    c = np.array(params.principal_point(W, H))     # inset centre when an active image region is set
     par = params.pixel_aspect if params.pixel_aspect > 0 else 1.0
+    if params.image_region:
+        x0, y0, rw, rh = params.image_region
+        if x0 + rw > W + 0.5 or y0 + rh > H + 0.5:
+            warnings.append(f"Active image region x={x0:g}..{x0 + rw:g}, y={y0:g}..{y0 + rh:g} does not fit in the "
+                            f"{W}x{H} frame; check kin_params.image_region.")
     scale = np.sqrt(np.abs(np.linalg.det(A[:, :2, :2])))      # <1 when zoomed in vs reference
     # Pixel-domain positions
     px, py = track.x.copy(), track.y.copy()
@@ -358,7 +394,7 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
 
     f0 = float("nan")
     if params.hfov_deg and params.hfov_deg > 0:
-        f0 = (W / 2.0) / np.tan(np.radians(params.hfov_deg) / 2.0)
+        f0 = params.focal_px(W)      # HFOV refers to the inset width when an active image region is set
         # camera pointing: accumulated pan in angle (linear), x right / y up
         th_cx = cam_pt[:, 0] / f0
         th_cy = -(cam_pt[:, 1] / par) / f0

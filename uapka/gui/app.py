@@ -23,6 +23,7 @@ from ..provenance import ERROR_SOURCES
 from ..scenarios import rows_table
 from ..tracker import Track
 from . import worker
+from .fovpanel import FovPanel
 from .frameview import FrameView
 from .timeline import Timeline
 
@@ -133,6 +134,7 @@ class MainWindow(QMainWindow):
         self.view.roiSelected.connect(self._on_roi)
         self.view.maskDrawn.connect(self._on_mask_drawn)
         self.view.pointClicked.connect(self._on_point)
+        self.view.fovPointClicked.connect(self._on_fov_point)
         ll.addWidget(self.view, 1)
         self.timeline = Timeline()
         self.timeline.frameClicked.connect(self.goto)
@@ -427,6 +429,9 @@ class MainWindow(QMainWindow):
         self.sp_par = QDoubleSpinBox(minimum=0.3, maximum=3.0, decimals=4, singleStep=0.01, value=kp.pixel_aspect)
         f.addRow("Horizontal FOV at frame 0 (deg)", self.sp_hfov)
         f.addRow("Pixel aspect ratio (w/h)", self.sp_par)
+        self.fov_panel = FovPanel(self)
+        f.addRow(self.fov_panel)
+        self.sp_hfov.valueChanged.connect(self._hfov_edited)
         l.addWidget(g)
         g = QGroupBox("Derivatives")
         f = QFormLayout(g)
@@ -662,6 +667,7 @@ class MainWindow(QMainWindow):
         self.sp_elev.setValue(sp.elevation_deg)
         self.sp_ovx.setValue(sp.observer_vx_ms)
         self.sp_ovy.setValue(sp.observer_vy_ms)
+        self.fov_panel.refresh()
 
     def _set_mode(self, mode: str):
         for btn, m in ((self.btn_draw_mask, "mask"), (self.btn_mark, "roi"), (self.btn_correct, "point")):
@@ -669,6 +675,8 @@ class MainWindow(QMainWindow):
                 btn.blockSignals(True)
                 btn.setChecked(False)
                 btn.blockSignals(False)
+        if mode != "fovpoint" and getattr(self, "fov_panel", None) is not None:
+            self.fov_panel.cancel_pick()
         self.view.mode = mode
         self.view.update()
         if mode != "none":
@@ -846,6 +854,7 @@ class MainWindow(QMainWindow):
         self._refresh_masks()
         self._refresh_objects()
         self._refresh_track_info()
+        self.fov_panel.refresh()
         self.goto(0)
         self.view.zoom_fit()
         msg = f"Loaded {os.path.basename(p.video_path)}: {n} frames"
@@ -906,6 +915,7 @@ class MainWindow(QMainWindow):
         v.others = [(t.x[k], t.y[k], f"{t.name}" + (" (control)" if t.role == "control" else ""))
                     for i, t in enumerate(self.p.tracks)
                     if i != self.p.active and t.status[k] not in ("NONE",) and np.isfinite(t.x[k])]
+        v.fov_points = self.fov_panel.overlay_points(k)
         v.update()
 
     def _stop_play(self):
@@ -1027,6 +1037,35 @@ class MainWindow(QMainWindow):
             self._update_overlays()
             self._status(f"Keyframe set at frame {self.p.file_frame(self.k)} ({x:.1f}, {y:.1f}). Run full analysis "
                          "(Ctrl+R) or 'Run tracking only'.")
+
+    # ---------------------------------------------------------------- derived field of view (fovpanel.py)
+    def _on_fov_point(self, x, y):
+        self.fov_panel.on_point(x, y)
+
+    def _hfov_edited(self, v: float):
+        """The spin box is the HFOV: write it through so fov_status() sees a hand edit as 'manual' at once."""
+        self.p.kin_params.hfov_deg = float(v)
+        self.fov_panel.refresh()
+
+    def apply_fov_estimate(self, est, index: Optional[int] = None) -> bool:
+        """Use a derived FOV estimate as the HFOV (Project.apply_fov), update the spin box and the status, and
+        recompute kinematics / scenarios the way a hand-entered HFOV change does."""
+        try:
+            warnings = self.p.apply_fov(est, index)
+        except ValueError as e:
+            self._msg("warning", "Apply FOV", str(e))
+            return False
+        self.sp_hfov.setValue(self.p.kin_params.hfov_deg)     # after apply_fov: the write-through keeps 'derived'
+        self._sync_params()
+        if self.p.kins:
+            self._recompute_results()
+        self.fov_panel.refresh()
+        if warnings:
+            self._msg("warning", "Apply FOV", "\n".join(warnings))
+        kind, src = self.p.fov_status()
+        self._status(f"HFOV set to {self.p.kin_params.hfov_deg:.4g} deg [{src.get('label') if src else kind}]"
+                     + ("; kinematics recomputed." if self.p.kins else "."), 10000)
+        return True
 
     def _remove_keyframe(self):
         tr = self.p.track

@@ -19,8 +19,9 @@ class FrameView(QWidget):
     roiSelected = Signal(float, float, float, float)     # cx, cy, w, h (image px)
     maskDrawn = Signal(int, int, int, int)               # x, y, w, h
     pointClicked = Signal(float, float)
+    fovPointClicked = Signal(float, float)                # FOV derivation: original video pixels, sub-pixel
 
-    MODES = ("none", "roi", "mask", "point")
+    MODES = ("none", "roi", "mask", "point", "fovpoint")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,6 +44,7 @@ class FrameView(QWidget):
         self.keyframe_here = False
         self.candidates = []     # list of (x, y, label)
         self.others = []         # other tracked objects at this frame: (x, y, label)
+        self.fov_points = []     # FOV-derivation points picked on this frame: (x, y, label)
         self.message = ""
 
     # ---------------------------------------------------------------- image
@@ -127,6 +129,13 @@ class FrameView(QWidget):
             p.setPen(QPen(QColor("#f0c020"), 1.5, Qt.DashLine))
             p.drawEllipse(c, 10, 10)
             p.drawText(c + QPointF(12, -8), label)
+        for x, y, label in self.fov_points:
+            c = self.to_widget(x, y)
+            p.setPen(QPen(QColor("#7fe0ff"), 1.5))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                p.drawLine(c + QPointF(4 * dx, 4 * dy), c + QPointF(14 * dx, 14 * dy))
+            p.drawEllipse(c, 2.5, 2.5)
+            p.drawText(c + QPointF(10, -10), label)
         if self.box is not None:
             cx, cy, w, h, st = self.box
             col = QColor(STATUS_COLORS.get(st, "#ffffff"))
@@ -145,7 +154,8 @@ class FrameView(QWidget):
         # HUD text
         p.setPen(QColor("#f0efec"))
         hint = {"roi": "Drag a box around the object", "mask": "Drag to draw a mask region",
-                "point": "Click the object's true position"}.get(self.mode, "")
+                "point": "Click the object's true position",
+                "fovpoint": "FOV: click the reference point (Esc cancels)"}.get(self.mode, "")
         txt = "  ".join(t for t in (hint, self.message) if t)
         if self.hover is not None:
             x, y = self.hover
@@ -192,6 +202,9 @@ class FrameView(QWidget):
             elif self.mode == "point":
                 q = self.to_img(ev.position())
                 self.pointClicked.emit(q.x(), q.y())
+            elif self.mode == "fovpoint":
+                q = self.to_img(ev.position())
+                self.fovPointClicked.emit(q.x(), q.y())
 
     def mouseMoveEvent(self, ev):
         if self._img is None:

@@ -25,7 +25,8 @@ class Prov(str, Enum):
     # Same assumption, pixel quantities (no FOV involved).
     STATIC_CAM_PX = "MEASURED+ASSUMED-STATIC-CAMERA"
     # A field of view that was not typed in but derived (fov.py) from reference information: two points with a
-    # known angle, an assumed object size/range, geo-located landmarks, or a HUD-label table. Carries a 1-sigma.
+    # known angle, an assumed object size/range, geo-located landmarks, >= 4 geo-located ground points (plane
+    # resection, which also yields the camera position and slant range), or a HUD-label table. Carries a 1-sigma.
     # Reported as "DERIVED-FOV(<method>)", see derived_fov_label().
     DERIVED_FOV = "DERIVED-FOV"
 

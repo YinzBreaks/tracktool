@@ -3,6 +3,7 @@ clip. Any exception reaching the Qt event loop, any blocking dialog, and any sta
 failure. Runs with QT_QPA_PLATFORM=offscreen and skips if a QApplication cannot be created."""
 
 import json
+import math
 import os
 import sys
 import time
@@ -27,6 +28,8 @@ except Exception as e:  # pragma: no cover - no usable Qt platform
 
 from uapka.gui import app as gui_app  # noqa: E402
 from uapka.gui.frameview import STATUS_COLORS  # noqa: E402
+from uapka.gui.fovpanel import FovDialog, HUD_EXAMPLE_TABLE, snap_to_blob  # noqa: E402
+from uapka.fov import load_fov_json  # noqa: E402
 from uapka.masks import Mask  # noqa: E402
 from uapka import tracker  # noqa: E402
 
@@ -754,6 +757,291 @@ def test_timeline_paints_every_status(gui):
     w.timeline.set_data(0)
     assert w.timeline.status is None
     w._refresh_track_info()
+    assert not gui.errors
+
+
+# ----------------------------------------------------------------------------- derived field of view
+def _sep_angle(p1, p2, W, H, hfov, par=1.0):
+    """Forward model (as in tests/test_fov.py): the true angle between two pixels for a known HFOV."""
+    from uapka.fov import angle_between_points, focal_px
+    return math.degrees(angle_between_points(p1, p2, W, H, focal_px(W, hfov), par))
+
+
+def _geo_pixels(cam, lms, W, H, fill=0.45):
+    """Point a pinhole camera at the landmarks, FOV so that they fill `fill` of the half-width: (hfov, pixels)."""
+    from uapka.fov import enu_vector, hfov_from_focal, project_direction
+    u = [enu_vector(cam, g) for g in lms]
+    u = [v / np.linalg.norm(v) for v in u]
+    fwd = sum(u)
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0.0, 0.0, 1.0])
+    right /= np.linalg.norm(right)
+    down = np.cross(fwd, right)
+    xmax = max(abs(float(d @ right) / float(d @ fwd)) for d in u)
+    f = fill * W / xmax
+    pts = [project_direction(d, W, H, f, fwd, right, down) for d in u]
+    assert all(0 <= x <= W and 0 <= y <= H for x, y in pts), pts
+    return hfov_from_focal(W, f), pts
+
+
+def test_fov_separation_pick_compute_apply(gui, clip):
+    ensure_video(gui, clip)
+    _, truth, gt = clip
+    w = gui.w
+    W, H = w.p.meta.width, w.p.meta.height
+    hfov = truth["config"]["hfov_deg"]
+    w.p.track.keyframes = {0: (gt[0][0], gt[0][1], 12, 12)}
+    w.sp_par.setValue(1.0)                 # the derivation honours the pixel aspect ratio; the clip is square-pixel
+    w.sp_hfov.setValue(0.0)
+    assert w.p.fov_status() == ("none", None) and "not set" in w.fov_panel.lbl_status.text()
+    w.run_all()
+    gui.wait()
+    assert w.p.kin is not None and not w.p.kin.has_angles()
+    dlg = w.fov_panel.open_dialog()
+    assert isinstance(dlg, FovDialog) and dlg.isVisible() and not dlg.isModal()
+    assert w.fov_panel.open_dialog() is dlg                          # reopened, not duplicated
+    assert "separation" in [dlg.cmb_method.itemText(i) for i in range(dlg.cmb_method.count())]
+    dlg.cmb_method.setCurrentText("separation")
+    assert dlg.tbl_points.rowCount() == 2 and dlg.tbl_points.isColumnHidden(4) and not dlg.btn_add.isEnabled()
+    # snap to the object: the click lands on the blob centroid with the smaller sigma
+    w.goto(0)
+    assert snap_to_blob(w.p.cache[0], gt[0][0] + 1.5, gt[0][1] - 1.0) is not None
+    dlg.chk_snap.setChecked(True)
+    dlg.pick(0)
+    assert w.view.mode == "fovpoint" and dlg.pick_row == 0
+    w.view.fovPointClicked.emit(gt[0][0] + 1.5, gt[0][1] - 1.0)
+    pt = dlg.points()[0] if dlg._cell(1, 1) else None
+    assert pt is None                                                # second point still empty: points() raises
+    assert dlg._snapped[0]
+    assert abs(float(dlg._cell(0, 1)) - gt[0][0]) < 1.0 and abs(float(dlg._cell(0, 2)) - gt[0][1]) < 1.0
+    assert "snapped" in gui.status() and dlg.pick_row == 1           # auto-advanced to the next empty row
+    # Escape leaves the mode and disarms the row
+    QTest.keyClick(w, Qt.Key_Escape)
+    assert w.view.mode == "none" and dlg.pick_row is None
+    # now two un-snapped points with a known angle
+    dlg.chk_snap.setChecked(False)
+    p1, p2 = (60.0, 80.0), (250.0, 170.0)
+    dlg.pick(0)
+    w.view.fovPointClicked.emit(*p1)
+    assert dlg.pick_row == 1 and w.view.mode == "fovpoint"
+    w.view.fovPointClicked.emit(*p2)
+    assert dlg.pick_row is None and w.view.mode == "none"
+    pts = dlg.points()
+    assert (pts[0]["x"], pts[0]["y"], pts[0]["frame"], pts[0]["snapped"]) == (60.0, 80.0, 0, False)
+    assert (pts[1]["x"], pts[1]["y"]) == (250.0, 170.0)
+    assert [lbl for _, _, lbl in w.view.fov_points] == ["F1", "F2"]
+    w.goto(1)
+    assert w.view.fov_points == []                                   # points belong to their frame
+    w.goto(0)
+    w.view.grab()
+    # no angle: a message, not a traceback
+    dlg.sp_angle.setValue(0.0)
+    assert dlg.compute() is None and dlg.estimate is None
+    kind, _, text = gui.pop_msgs()[-1]
+    assert kind == "warning" and "angle" in text
+    # coinciding points: the library's ValueError is shown
+    dlg.set_point(1, 60.0, 80.0, 0)
+    dlg.sp_angle.setValue(1.0)
+    assert dlg.compute() is None and "coincide" in gui.pop_msgs()[-1][2]
+    dlg.set_point(1, *p2, 0)
+    dlg.sp_angle.setValue(_sep_angle(p1, p2, W, H, hfov))
+    dlg.sp_angle_sigma.setValue(0.01)
+    est = dlg.compute()
+    assert est is not None and est.hfov_deg == pytest.approx(hfov, rel=1e-6) and est.method == "separation"
+    assert est.inputs["frame"] == 0 and est.inputs["click_sigma_px"] == 1.0 and est.width == W
+    txt = dlg.txt_result.toPlainText()
+    assert "HFOV = 2" in txt and "σ contributions" in txt and "angle_deg" in txt and "p1.x" in txt
+    assert dlg.apply()
+    assert w.sp_hfov.value() == pytest.approx(2.0) and w.p.fov_status()[0] == "derived"
+    assert w.p.fov_source["method"] == "separation" and len(w.p.fov_estimates) == 1
+    lbl = w.fov_panel.lbl_status.text()
+    assert lbl.startswith("derived: HFOV = 2") and "[DERIVED-FOV(separation)]" in lbl and "on frame 0" in lbl
+    assert "(1)" in w.fov_panel.btn_history.text()
+    assert w.p.kin.has_angles() and "deg/s" in w.txt_kin.toPlainText()      # recomputed like an HFOV edit
+    assert not [m for m in gui.pop_msgs() if m[0] == "error"]
+    # editing the HFOV by hand demotes it to manual; the estimate stays in the history
+    w.sp_hfov.setValue(3.0)
+    assert w.p.fov_status() == ("manual", None) and w.fov_panel.lbl_status.text().startswith("manual 3.0000")
+    assert len(w.p.fov_estimates) == 1
+    # applying on a frame other than the kinematics reference frame is warned about, but applied
+    w.sp_start.setValue(10)
+    assert dlg.apply() and w.p.fov_status()[0] == "derived" and len(w.p.fov_estimates) == 1
+    kind, _, text = gui.pop_msgs()[-1]
+    assert kind == "warning" and "reference frame" in text
+    w.sp_start.setValue(0)
+    assert not gui.errors
+
+
+def test_fov_geo_path(gui, clip):
+    ensure_video(gui, clip)
+    w = gui.w
+    W, H = w.p.meta.width, w.p.meta.height
+    dlg = w.fov_panel.open_dialog()
+    dlg.cmb_method.setCurrentText("geo")
+    assert dlg.tbl_points.rowCount() == 2 and not dlg.tbl_points.isColumnHidden(4) and dlg.btn_add.isEnabled()
+    cam = (37.95, 23.72, 8000.0)
+    lms = [(37.85, 23.85, 0.0), (37.845, 23.858, 0.0), (37.856, 23.862, 20.0)]
+    hfov, pts = _geo_pixels(cam, lms, W, H)
+    dlg.add_row()
+    assert dlg.tbl_points.rowCount() == 3
+    for i, ((x, y), (la, lo, al)) in enumerate(zip(pts, lms)):
+        dlg.set_point(i, x, y, 0)
+        dlg.set_geo(i, la, lo, f"{al}m")
+    dlg.ed_cam_lat.setText("37.95")
+    dlg.ed_cam_lon.setText("23.72")
+    dlg.ed_cam_alt.setText("8km")
+    dlg.ed_cam_sigma.setText("100m")
+    dlg.ed_lm_sigma.setText("20m")
+    est = dlg.compute()
+    assert est is not None and est.hfov_deg == pytest.approx(hfov, rel=1e-5) and est.method == "geo"
+    assert est.inputs["camera"]["alt_m"] == 8000.0 and est.inputs["camera_sigma_m"] == 100.0
+    assert "Consistency check" in dlg.txt_result.toPlainText() and "cam.u" in dlg.txt_result.toPlainText()
+    assert dlg.apply() and w.p.fov_status()[1]["label"] == "DERIVED-FOV(geo)"
+    assert "[DERIVED-FOV(geo)]" in w.fov_panel.lbl_status.text() and w.sp_hfov.value() == pytest.approx(hfov, abs=1e-4)
+    # bad inputs are messages, not tracebacks
+    dlg.set_geo(0, "abc", "23.85", "0")
+    assert dlg.compute() is None and "latitude" in gui.pop_msgs()[-1][2]
+    dlg.set_geo(0, "37.85", "23.85", "12 parsecs")
+    assert dlg.compute() is None and gui.pop_msgs()[-1][0] == "warning"
+    dlg.set_geo(0, *lms[0])
+    dlg.ed_cam_lat.setText("")
+    assert dlg.compute() is None and "camera" in gui.pop_msgs()[-1][2]
+    dlg.ed_cam_lat.setText("37.95")
+    # the minimum number of rows is kept
+    dlg.remove_row()
+    assert dlg.tbl_points.rowCount() == 2
+    dlg.remove_row()
+    assert dlg.tbl_points.rowCount() == 2 and "at least" in gui.status()
+    # an inset region is passed through (the library translates the points into it)
+    dlg.set_region((10, 5, W - 20, H - 10))
+    dlg.add_row()
+    hfov_in, pts_in = _geo_pixels(cam, lms, W - 20, H - 10)
+    for i, ((x, y), (la, lo, al)) in enumerate(zip(pts_in, lms)):
+        dlg.set_point(i, x + 10, y + 5, 0)
+        dlg.set_geo(i, la, lo, f"{al}m")
+    est = dlg.compute()
+    assert est is not None and est.hfov_deg == pytest.approx(hfov_in, rel=1e-5)
+    assert list(est.region) == [10.0, 5.0, float(W - 20), float(H - 10)]
+    dlg.set_region(None)
+    assert dlg.region() is None
+    assert not gui.errors
+
+
+def test_fov_hud_path_and_example_table(gui, clip):
+    ensure_video(gui, clip)
+    w = gui.w
+    dlg = w.fov_panel.open_dialog()
+    dlg.cmb_method.setCurrentText("hud")
+    assert not dlg.grp_points.isEnabled() and dlg.grp_points.isHidden() and dlg.overlay_points(w.k) == []
+    dlg.cmb_method.setCurrentText("separation")
+    assert not dlg.grp_points.isHidden()
+    dlg.cmb_method.setCurrentText("hud")
+    dlg.tbl_hud.setRowCount(0)
+    dlg.ed_hud_label.setText("")
+    assert dlg.compute() is None and "label" in gui.pop_msgs()[-1][2]
+    dlg.ed_hud_label.setText("NAR")
+    assert dlg.compute() is None and "empty" in gui.pop_msgs()[-1][2]
+    dlg.load_hud_example()
+    assert dlg.hud_table() == HUD_EXAMPLE_TABLE == {"NAR": 0.7, "MFOV": 2.8, "WFOV": 6.0}
+    assert dlg.sp_hud_sigma.value() == 30.0
+    note = dlg.lbl_hud_note.text()
+    assert "EXAMPLE" in note and "secondary sources" in note and "1.5" in note and "30%" in note
+    dlg.ed_hud_label.setText("zoom9")
+    assert dlg.compute() is None and "not in the table" in gui.pop_msgs()[-1][2]      # KeyError path
+    dlg.ed_hud_label.setText("nar")
+    est = dlg.compute()
+    assert est is not None and est.hfov_deg == 0.7 and est.sigma_pct == pytest.approx(30.0)
+    assert est.inputs["table"]["MFOV"] == 2.8 and est.inputs["frame"] == w.k
+    assert "table uncertainty" in dlg.txt_result.toPlainText()
+    assert dlg.apply() and w.sp_hfov.value() == pytest.approx(0.7) and w.p.fov_status()[0] == "derived"
+    assert w.p.fov_source["inputs"]["table"] == HUD_EXAMPLE_TABLE          # stored with the project, not hard-coded
+    assert "[DERIVED-FOV(hud)]" in w.fov_panel.lbl_status.text()
+    # an edited table is what gets stored
+    dlg.set_hud_row(0, "NAR", "1.5")
+    est = dlg.compute()
+    assert est.hfov_deg == 1.5 and dlg.apply() and w.p.fov_source["inputs"]["table"]["NAR"] == 1.5
+    # a fresh dialog pre-fills the table from the project's last HUD estimate
+    d2 = FovDialog(w)
+    assert d2.load_hud_table_from_project() and d2.hud_table()["NAR"] == 1.5 and d2.ed_hud_label.text() == "nar"
+    d2.close()
+    assert not gui.errors
+
+
+def test_fov_history_reapply_delete_export(gui, clip, tmp_path):
+    ensure_video(gui, clip)
+    w = gui.w
+    hist = w.fov_panel.open_history()
+    assert hist.isVisible() and not hist.isModal()
+    n = len(w.p.fov_estimates)
+    assert n >= 3 and hist.lst.count() == n
+    methods = [e["method"] for e in w.p.fov_estimates]
+    assert methods[:3] == ["separation", "geo", "hud"]
+    assert "in use" in hist.lst.item(n - 1).text() and "in use" not in hist.lst.item(0).text()
+    assert hist.reapply(0)
+    assert w.sp_hfov.value() == pytest.approx(2.0) and w.p.fov_source["index"] == 0
+    assert "in use" in hist.lst.item(0).text() and "derived: HFOV = 2" in w.fov_panel.lbl_status.text()
+    hist.lst.setCurrentRow(0)
+    assert "true angle" in hist.txt.toPlainText()
+    assert not hist.delete(0) and gui.pop_msgs()[-1][0] == "info"           # the one in use is protected
+    assert len(w.p.fov_estimates) == n
+    assert hist.delete(n - 1) and len(w.p.fov_estimates) == n - 1 and w.p.fov_status()[0] == "derived"
+    assert hist.lst.count() == n - 1
+    # deleting an earlier estimate keeps the in-use one in use (its index shifts)
+    assert hist.reapply(1) and w.p.fov_source["index"] == 1 and w.p.fov_source["method"] == "geo"
+    assert hist.delete(0)
+    assert w.p.fov_source["index"] == 0 and w.p.fov_status()[0] == "derived" and w.p.fov_estimates[0]["method"] == "geo"
+    out = tmp_path / "one.json"
+    assert hist.export_selected(str(out), 0)
+    assert load_fov_json(str(out))[0]["hfov_deg"] == w.p.fov_estimates[0]["hfov_deg"]
+    assert not hist.reapply(99) and "Select" in gui.status()
+    assert not hist.export_selected(str(out), 99)
+    assert not gui.errors
+
+
+def test_fov_json_export_import_round_trip(gui, clip, tmp_path):
+    ensure_video(gui, clip)
+    _, truth, _ = clip
+    w = gui.w
+    out = tmp_path / "fov_all.json"
+    assert w.fov_panel.export_json(str(out))
+    ests = load_fov_json(str(out))
+    assert len(ests) == len(w.p.fov_estimates) >= 2 and ests[0]["method"] == "geo"
+    w.sp_hfov.setValue(1.0)
+    assert w.p.fov_status()[0] == "manual"
+    assert w.fov_panel.import_json(str(out))
+    assert w.p.fov_status()[0] == "derived" and w.sp_hfov.value() == pytest.approx(ests[-1]["hfov_deg"], abs=1e-4)
+    assert len(w.p.fov_estimates) == len(ests)                             # nothing duplicated
+    assert "Imported" in gui.status()
+    # the dialog saves its own estimate
+    dlg = w.fov_panel.open_dialog()
+    assert dlg.estimate is not None
+    one = tmp_path / "one.json"
+    assert dlg.save_json(str(one)) and load_fov_json(str(one))[0]["method"] == dlg.estimate.method
+    # bad files are messages
+    bad = tmp_path / "bad.json"
+    bad.write_text("[]")
+    assert not w.fov_panel.import_json(str(bad)) and "no FOV" in gui.pop_msgs()[-1][2]
+    bad.write_text("{not json")
+    assert not w.fov_panel.import_json(str(bad)) and gui.pop_msgs()[-1][0] == "warning"
+    assert not w.fov_panel.import_json(str(tmp_path / "missing.json")) and gui.pop_msgs()[-1][0] == "warning"
+    # the derived status survives a project save / reload
+    proj = tmp_path / "fovproj.json"
+    assert w.save_project(str(proj))
+    w.sp_hfov.setValue(0.0)
+    assert w.open_project(str(proj))
+    gui.wait()
+    assert w.p.fov_status()[0] == "derived" and w.fov_panel.lbl_status.text().startswith("derived")
+    assert len(w.p.fov_estimates) == len(ests)
+    # a project without estimates has nothing to export
+    w.p.fov_estimates.clear()
+    w.p.fov_source = None
+    w.fov_panel.refresh()
+    assert not w.fov_panel.export_json(str(tmp_path / "none.json")) and gui.pop_msgs()[-1][0] == "info"
+    dlg.close()
+    w.fov_panel.history.close()
+    gui.pump()
+    assert w.view.fov_points == []
+    w.sp_hfov.setValue(truth["config"]["hfov_deg"])
     assert not gui.errors
 
 

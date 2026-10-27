@@ -264,16 +264,25 @@ apparent motion then gets attributed to the object. The tool counters this in se
 5. **Zoom and roll only when supported.** Per-step scale and rotation on weak backgrounds are noise,
    and chaining them produces fake zoom and roll. They are kept only where a windowed median shows
    a significant, consistent trend; elsewhere the model is translation-only.
-6. **Long-baseline closure check.** Frame-to-frame registration can be *confidently wrong*: locked
-   onto sensor-fixed or encoder-frozen content, it agrees with itself. Every ~10 new frames the
-   tool registers directly across the interval, starting from the chained estimate.
+6. **Long-baseline closure check and correction.** Frame-to-frame registration can be *confidently
+   wrong*: sensor-locked residue (translucent overlays, FPN and compression residue) drags every
+   small step toward zero, and at sub-pixel step sizes that residue cannot be separated from real
+   motion. Every ~10 new frames (fewer on fast pans, so the frames still overlap) the tool
+   registers directly across the interval, starting from the chained estimate.
    - **Agreement:** confidence is kept.
-   - **Disagreement:** confidence is capped hard.
+   - **Disagreement:** the chain inside the interval is re-scaled so that its end-to-end motion
+     equals the direct registration (the correction is spread over the steps in proportion to the
+     chain's own increments), and those steps carry the closure registration's confidence
+     (flag `CLOSURE_CORRECTED`). On a released MQ-9 clip this recovered a slow 1 px/frame drift
+     that per-step registration had reported as 0.1 px/frame.
    - **Scene can't be registered across the interval** (e.g. sea texture that decorrelates within a
      second): the camera motion is **unverifiable** and capped below the trust threshold.
-7. **Confidence score (0–1) per frame pair.** Built from inlier count and ratio, residual RMS,
-   spatial coverage of inliers, agreement with phase correlation on the cleaned frames,
-   competing-cluster ambiguity and the closure check. Fallbacks (phase correlation only, or no
+7. **Confidence score (0–1) per frame pair.** Built from inlier count and ratio, residual RMS
+   (calibrated for real footage, where inlier residuals of 0.5–0.9 px are normal), spatial
+   coverage of inliers, agreement with phase correlation on the cleaned frames (only when its
+   peak is strong), competing-cluster ambiguity and the closure check. Feature extraction and
+   phase correlation work on the usable image area, so a sensor inset between redaction panels
+   gets the full feature budget. Fallbacks (phase correlation only, or no
    estimate) get low confidence. Each registration step also carries a 1σ in pixels.
    Derivatives whose fit window contains an untrusted step are kept in the CSV (flagged) but
    excluded from headline numbers and scenario tables. If nothing is trusted, the report says the
@@ -320,6 +329,7 @@ a sanity check; it is several percent off for off-centre points at wide FOVs).
 | `size` | two points spanning an **assumed** size at an **assumed** range (± σ each) | `DERIVED-FOV(size)` |
 | `geo` | camera lat/lon/alt and ≥ 2 geo-located landmarks clicked in the frame (WGS-84, local ENU); ≥ 3 adds a consistency residual | `DERIVED-FOV(geo)` |
 | `hud` | a user-supplied table of HUD zoom labels → HFOV | `DERIVED-FOV(hud)` |
+| `ground` | look-down footage, camera position **unknown**: ≥ 4 ground features of known lat/lon/alt clicked in one frame (5–6 spread over the frame add a consistency check) | `DERIVED-FOV(ground)` |
 
 Click uncertainty (±1 px per point by default) and every input σ are propagated by finite
 differences and combined in quadrature. `--save fov.json` stores the estimate;
@@ -327,6 +337,30 @@ differences and combined in quadrature. `--save fov.json` stores the estimate;
 (`--hfov` wins if both are given, and is reported as "user input, no uncertainty given"). All
 angular rates and scenario values scale linearly with the HFOV, so its relative σ carries straight
 through to them.
+
+**Ground-plane resection (`ground`).** The points are put in a local ENU frame, a least-squares
+plane is fitted through them (its RMS is reported) and the plane→image homography
+H = λK[r₁ r₂ t] is fitted by the DLT. With the principal point at the image centre, zero skew and
+square pixels, the orthonormality of r₁, r₂ gives two equations linear in 1/f² (the image of the
+absolute conic), solved in closed form; their disagreement is a diagnostic. Decomposing H then
+yields the camera position (lat/lon/alt), its height above the plane, the slant range to the
+image centre, the look-down angle and the metres-per-pixel at the image centre, all in
+`diagnostics` (`camera_lat/lon/alt_m`, `slant_range_m`, `elevation_deg`,
+`ground_sample_m_per_px`, each with a σ where one applies). A near-nadir view has almost no
+perspective and determines only f/height, not f: the estimate then says so and flags the HFOV and
+position as unusable, while the metres-per-pixel (what a ground-relative speed needs) stays well
+determined and keeps its own σ. This is physics, not a failure.
+
+**Active image region (inset).** Released sensor video is often a sensor image pasted inside a
+larger frame (e.g. a 1280×720 file whose live image occupies x = 360..922, the rest being
+redaction panels). The principal point is then the inset centre and the HFOV is that of the inset
+width. Pass `--region X0,Y0,W,H` (full-frame px) to any `fov` method (or `region=` in Python;
+`fov.detect_inset(frames)` finds it from the sharp, changing columns and rows): the clicked points
+are translated into the inset and the returned HFOV is the inset's. Such an estimate must be
+applied with the same region, which `apply_fov` does by copying it into
+`kin_params.image_region`, so that the kinematics use the inset centre as principal point and the
+inset width for f; the alternative is to crop the video to the inset. Applying an inset HFOV to
+the full frame would overstate every angle by (frame width / inset width).
 
 ### 5. Scenarios (`scenarios.py`): ASSUMED only
 For an assumed range R (held constant):
@@ -366,11 +400,11 @@ a HUD, a reticle and a redaction block, and a known object trajectory. HFOV is 2
 
 | Clip | Naive PC pan error | Our pan error | Median cam. conf. | ω true | ω measured (median) | ω z-spread* | Lateral α true | Lateral α measured |
 |---|---|---|---|---|---|---|---|---|
-| lossless (FFV1), FPN 6, texture 3 | 98.3% | 0.5% | 0.77 | 0.1581 | 0.1573 | 0.44 | 0 | 0.0079 |
-| lossy mp4v, FPN 6, texture 3 | 99.3% | 3.0% | 0.43 | 0.1581 | 0.1578 | 0.69 | 0 | 0.0073 |
-| lossy mp4v, FPN 6, texture 6 | 97.2% | 0.8% | 0.62 | 0.1581 | 0.1579 | 0.55 | 0 | 0.0101 |
-| lossless, zoom 1.0→1.5 | 98.9% | 0.3% | 0.47 | 0.1581 | 0.1578 | 0.29 | 0 | 0.0121 |
-| lossless, turning object 90°/s | 97.8% | 0.3% | 0.80 | 0.1580 | 0.1533 | 0.38 | 0.2484 | 0.2433 |
+| lossless (FFV1), FPN 6, texture 3 | 98.3% | 0.1% | 0.93 | 0.1581 | 0.1582 | 0.44 | 0 | 0.0080 |
+| lossy mp4v, FPN 6, texture 3 | 99.3% | 3.0% | 0.61 | 0.1581 | 0.1578 | 0.98 | 0 | 0.0073 |
+| lossy mp4v, FPN 6, texture 6 | 97.2% | 0.8% | 0.78 | 0.1581 | 0.1579 | 0.66 | 0 | 0.0101 |
+| lossless, zoom 1.0→1.5 | 98.9% | 0.1% | 0.60 | 0.1581 | 0.1580 | 0.29 | 0 | 0.0091 |
+| lossless, turning object 90°/s | 97.8% | 0.1% | 0.96 | 0.1580 | 0.1535 | 0.45 | 0.2484 | 0.2432 |
 
 \*Standard deviation of (measured − true)/σ over frames with camera confidence ≥ 0.3.
 1.0 means honest error bars; below 1 means conservative. Angular units are deg/s and deg/s². The

@@ -26,6 +26,7 @@ directly and interpolate the camera path in between.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -120,14 +121,27 @@ def _is_identity_like(M: np.ndarray, tol_px: float = 0.3) -> bool:
     return np.hypot(dx, dy) < tol_px and abs(s - 1) < 1e-3 and abs(rot) < 0.05
 
 
+def _allowed_bbox(allowed: np.ndarray) -> tuple[int, int, int, int]:
+    """(x0, y0, x1, y1) bounding box of usable pixels; the whole frame if nothing is allowed."""
+    ys, xs = np.nonzero(allowed)
+    if len(xs) == 0:
+        return 0, 0, allowed.shape[1], allowed.shape[0]
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
 def _grid_features(img8: np.ndarray, allowed: np.ndarray, max_features: int) -> Optional[np.ndarray]:
+    # the grid spans the usable area (e.g. a sensor inset between redaction panels), so masked-off
+    # regions do not eat the feature budget
+    bx0, by0, bx1, by1 = _allowed_bbox(allowed)
     H, W = img8.shape
+    if (bx1 - bx0) * (by1 - by0) > 0.6 * W * H:      # not a true inset: keep the plain frame grid
+        bx0, by0, bx1, by1 = 0, 0, W, H
     per = max(4, max_features // (GRID * GRID))
     pts = []
     for gy in range(GRID):
         for gx in range(GRID):
-            y0, y1 = gy * H // GRID, (gy + 1) * H // GRID
-            x0, x1 = gx * W // GRID, (gx + 1) * W // GRID
+            y0, y1 = by0 + gy * (by1 - by0) // GRID, by0 + (gy + 1) * (by1 - by0) // GRID
+            x0, x1 = bx0 + gx * (bx1 - bx0) // GRID, bx0 + (gx + 1) * (bx1 - bx0) // GRID
             sub_mask = allowed[y0:y1, x0:x1]
             if sub_mask.sum() < 255 * 50:
                 continue
@@ -234,7 +248,9 @@ def _feature_register(prev_c: np.ndarray, cur_c: np.ndarray, excluded: np.ndarra
     coverage = _coverage(dst[inl], allowed)
     c_count = np.clip((n_in - params.min_inliers) / 40.0, 0, 1)
     c_ratio = np.clip((n_in / max(n_tracked, 1) - 0.2) / 0.6, 0, 1)
-    c_resid = float(np.exp(-(rms / 0.5) ** 2))
+    # Inlier residuals of real footage sit at 0.5-0.9 px (interpolation, slight parallax, compression); only a
+    # residual approaching the RANSAC threshold means the model does not fit. Synthetic frames reach ~0.1 px.
+    c_resid = float(np.exp(-(rms / 1.5) ** 2))
     c_cov = np.clip(coverage / 0.5, 0, 1)
     quality = float((max(c_count, 1e-3) * max(c_ratio, 1e-3) * c_resid * max(c_cov, 1e-3)) ** 0.25)
     quality *= 1.0 - 0.6 * ambiguity
@@ -246,15 +262,20 @@ def register_pair(prev_raw: np.ndarray, cur_raw: np.ndarray, prev_c: np.ndarray,
     """Estimate background motion prev -> cur. `excluded` is uint8 (255 = do not use)."""
     flags: list[str] = []
     allowed = _allowed(excluded, params.border_px)
-    pc_raw = _phase_corr(prev_raw, cur_raw, params.pc_max_width, None)
-    pc_clean = _phase_corr(prev_c, cur_c, params.pc_max_width, excluded)
+    bx0, by0, bx1, by1 = _allowed_bbox(allowed)
+    crop = (slice(by0, by1), slice(bx0, bx1))
+    pc_raw = _phase_corr(prev_raw[crop], cur_raw[crop], params.pc_max_width, None)
+    pc_clean = _phase_corr(prev_c[crop], cur_c[crop], params.pc_max_width, excluded[crop])
     est = _feature_register(prev_c, cur_c, excluded, allowed, params)
     if est is not None:
         M = est["M"]
         flags += est["flags"]
         d_pc = float(np.hypot(M[0, 2] - pc_clean[0], M[1, 2] - pc_clean[1]))
-        agree = 0.5 + 0.5 * np.exp(-(d_pc / 1.5) ** 2) if pc_clean[2] > 0.08 else 1.0
-        if pc_clean[2] > 0.08 and d_pc > 3:
+        # a weak phase-correlation peak (large motion, masked regions, little overlap) is no evidence against
+        # the feature estimate: only a strong peak may lower the confidence
+        strong = pc_clean[2] > 0.25
+        agree = 0.5 + 0.5 * np.exp(-(d_pc / 1.5) ** 2) if strong else 1.0
+        if strong and d_pc > 3:
             flags.append("PHASECORR_DISAGREES")
         conf = est["quality"] * agree
         method = "features"
@@ -581,41 +602,100 @@ def _simplify_model(ct: CameraTrack, act: list[int], shape, params: CameraParams
 
 
 def _closure_check(ct: CameraTrack, frames, act: list[int], prep, exclusion, params: CameraParams) -> None:
-    """Long-baseline consistency: register frames ~closure_frames apart directly, starting from the chained
-    estimate, and compare. Frame-to-frame registration can be confidently wrong (locked to sensor-fixed or
-    encoder-frozen content); a direct registration across a longer interval exposes that. If the scene cannot
-    be registered across the interval at all, the chained motion is unverifiable and is capped below trust."""
+    """Long-baseline consistency check AND correction.
+
+    Frame-to-frame registration can be confidently wrong: sensor-locked residue (translucent overlays, FPN and
+    compression residue) biases every small step towards zero, and the bias is invisible at sub-pixel step
+    sizes. Registering directly across a longer interval (10 new frames, or fewer on fast pans so the frames
+    still overlap) separates real motion from the residue. Each interval is then handled as:
+      consistent   direct registration agrees with the chain -> confidence kept
+      corrected    direct registration succeeds but disagrees -> the chain inside the interval is re-scaled
+                   so that its end-to-end motion equals the direct registration (the correction is spread
+                   over the steps in proportion to the chain's own increments; evenly when the chain is
+                   near-static), confidence = closure quality, flag CLOSURE_CORRECTED
+      unverifiable scene cannot be registered across the interval -> chain kept, confidence capped at 0.25
+    """
     L = params.closure_frames
-    n_ok = n_bad = n_unv = 0
+    n_ok = n_fix = n_unv = 0
     H, W = frames[0].shape[:2]
-    for i in range(0, len(act) - 1, L):
+    bx0, by0, bx1, by1 = _allowed_bbox(_allowed(exclusion(act[0]), params.border_px))
+    span_px = 0.3 * min(bx1 - bx0, by1 - by0)
+    centre = np.array([(bx0 + bx1) / 2.0, (by0 + by1) / 2.0, 1.0])
+    A_chain = ct.A.copy()
+    A_new = ct.A.copy()
+    A_anc = A_chain[act[0]].copy()          # anchored pose of the current interval start
+
+    def chain_disp(i, j):
+        T = np.linalg.inv(A_chain[act[j]]) @ A_chain[act[i]]
+        return float(np.hypot(*((T @ centre)[:2] - centre[:2])))
+
+    i = 0
+    while i < len(act) - 1:
         j = min(i + L, len(act) - 1)
+        while j - i > 2 and chain_disp(i, j) > span_px:
+            j -= 1
         a, b = act[i], act[j]
-        guess = ct.between(a, b)
+        guess = np.linalg.inv(A_chain[b]) @ A_chain[a]          # frame a -> frame b per the chain
         warped = cv2.warpAffine(prep(a), guess[:2], (W, H), flags=cv2.INTER_LINEAR)
         excl = exclusion(a, b) | cv2.warpAffine(exclusion(a), guess[:2], (W, H), flags=cv2.INTER_NEAREST,
                                                 borderValue=255)
         est = _feature_register(warped, prep(b), excl, _allowed(excl, params.border_px), params)
         chain_sig = float(np.sqrt(sum(ct.pairs[act[m]].sigma_px ** 2 for m in range(i + 1, j + 1))))
+        steps = list(range(i + 1, j + 1))
         if est is None or est["quality"] < 0.3:
-            cap, flag = 0.25, "CLOSURE_UNVERIFIABLE"
+            # keep the chain, but re-base it on the anchored pose so earlier corrections carry through
+            shift = A_anc @ np.linalg.inv(A_chain[a])
+            for m in steps:
+                A_new[act[m]] = shift @ A_chain[act[m]]
+                for k in range(act[m - 1] + 1, act[m]):        # duplicates hold the previous pose
+                    A_new[k] = A_new[act[m - 1]]
+                pr = ct.pairs[act[m]]
+                pr.confidence = min(pr.confidence, 0.25)
+                pr.flags = pr.flags + ["CLOSURE_UNVERIFIABLE"]
+            A_anc = A_new[b].copy()
             n_unv += 1
+            i = j
+            continue
+        M_ab = np.vstack([est["M"], [0, 0, 1]]) @ guess            # direct a -> b
+        resid = float(np.hypot(*est["M"][:, 2]))
+        tol = max(1.5, 3 * chain_sig, 1.0 * math.sqrt(j - i))
+        A_end = A_anc @ np.linalg.inv(M_ab)                         # anchored pose at b
+        if resid <= tol:
+            flag, n_ok, conf_cap = None, n_ok + 1, 1.0
         else:
-            resid = float(np.hypot(*est["M"][:, 2]))
-            if resid > max(1.5, 3 * chain_sig):
-                cap, flag = 0.1, "CLOSURE_INCONSISTENT"
-                n_bad += 1
-            else:
-                cap, flag = 1.0, None
-                n_ok += 1
-        for m in range(i + 1, j + 1):
-            for k in range(act[m - 1] + 1, act[m] + 1):
-                pr = ct.pairs[k]
-                pr.confidence = min(pr.confidence, cap)
-                if flag:
-                    pr.flags = pr.flags + [flag]
-    ct.closure_info = (f"Long-baseline check every {L} new frames: {n_ok} consistent, {n_bad} inconsistent, "
-                       f"{n_unv} unverifiable (scene could not be registered across the interval).")
+            flag, n_fix = "CLOSURE_CORRECTED", n_fix + 1
+            conf_cap = float(est["quality"]) * 0.8
+        # spread the end-to-end correction over the interval: weights = the chain's own step sizes
+        # (near-static chain: even weights), applied to the similarity parameters of the correction
+        mags = np.array([float(np.hypot(*ct.pairs[act[m]].M[:, 2])) for m in steps])
+        wts = mags / mags.sum() if mags.sum() > 1.0 else np.full(len(steps), 1.0 / len(steps))
+        cum = np.cumsum(wts)
+        C = A_end @ np.linalg.inv(A_anc @ np.linalg.inv(A_chain[a]) @ A_chain[b])   # correction in ref space
+        pC = _sim_params(C)
+        for m, w in zip(steps, cum):
+            Cw = _sim_matrix(pC * w)
+            A_new[act[m]] = Cw @ A_anc @ np.linalg.inv(A_chain[a]) @ A_chain[act[m]]
+            for k in range(act[m - 1] + 1, act[m]):            # duplicates hold the previous pose
+                A_new[k] = A_new[act[m - 1]]
+            if flag:
+                pr = ct.pairs[act[m]]
+                pr.flags = pr.flags + [flag]
+                # the per-step registration was wrong here: the step inherits the closure registration's quality
+                pr.confidence = conf_cap
+                pr.sigma_px = float(max(pr.sigma_px, _step_sigma(est["rms"], est["n_in"], est["quality"]) /
+                                        math.sqrt(len(steps))))
+        A_anc = A_new[b].copy()
+        i = j
+    # per-step M consistent with the corrected poses
+    for k in range(1, len(A_new)):
+        if ct.pairs[k].method in ("skipped", "ref"):
+            continue
+        T = np.linalg.inv(A_new[k]) @ A_new[k - 1]
+        ct.pairs[k].M = T[:2]
+    ct.A = A_new
+    ct.closure_info = (f"Long-baseline check (<= {L} new frames, shortened on fast pans): {n_ok} intervals consistent, "
+                       f"{n_fix} corrected from the direct registration, {n_unv} unverifiable (scene could not be "
+                       f"registered across the interval).")
 
 
 def _anchor_correct(ct: CameraTrack, frames, anchors: list[int], prep, exclusion, params: CameraParams) -> bool:

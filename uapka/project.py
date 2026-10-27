@@ -157,6 +157,9 @@ class Project:
         else:
             self.fov_estimates[index] = est
         self.kin_params.hfov_deg = float(est["hfov_deg"])
+        # an estimate made for an inset (active image region) only applies with that region: same principal point,
+        # HFOV referring to the inset width; an estimate without one resets it to the whole frame
+        self.kin_params.image_region = [float(v) for v in est["region"]] if est.get("region") else None
         self.fov_source = {**est, "index": index}
         warnings = []
         if self.meta is not None and (int(est.get("width", self.meta.width)), int(est.get("height", self.meta.height))) \
