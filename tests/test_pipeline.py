@@ -58,7 +58,7 @@ def test_every_csv_column_is_labelled_and_scenarios_scale(lossless_project, tmp_
     with open(tmp_path / "per_frame.csv") as f:
         header = next(csv.reader(f))
     data_cols = [h for h in header if h not in ("frame", "used_in_fit", "in_summaries", "flags")]
-    assert all(re.search(r"\[(MEASURED|MEASURED\+FOV|ASSUMED|MEASURED\+FOV\+ASSUMED-STATIC-CAMERA)\]$", h)
+    assert all(re.search(r"\[(MEASURED|MEASURED\+FOV|ASSUMED|MEASURED\+FOV\+ASSUMED-STATIC-CAMERA|MEASURED\+ASSUMED-STATIC-CAMERA)\]$", h)
                for h in data_cols), data_cols
     assert not any("ASSUMED" in h for h in header), "per-frame CSV must contain no scenario values"
     with open(tmp_path / "scenario_sweep.csv") as f:
@@ -141,3 +141,20 @@ def test_project_roundtrip(lossless_project, tmp_path):
     assert q.track.keyframes == {k: tuple(v) for k, v in p.track.keyframes.items()}
     assert np.allclose(q.track.x, p.track.x, equal_nan=True)
     assert len(q.masks) == len(p.masks)
+
+
+def test_static_camera_assumption_is_labelled(lossless_project, tmp_path):
+    p = lossless_project
+    try:
+        p.kin_params.use_camera = False
+        kin = p.run_kinematics()
+        assert kin.cols["omega"][0].value == "MEASURED+FOV+ASSUMED-STATIC-CAMERA"
+        assert kin.cols["stab_speed"][0].value == "MEASURED+ASSUMED-STATIC-CAMERA"
+        assert kin.cols["img_speed"][0].value == "MEASURED"
+        assert any("static camera ASSUMED" in w for w in kin.warnings)
+        from uapka.export import build_report
+        md, _ = build_report(p, {})
+        assert "static camera is ASSUMED" in md and "trusted camera motion in derivative window" not in md
+    finally:
+        p.kin_params.use_camera = True
+        p.run_kinematics()

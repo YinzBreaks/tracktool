@@ -53,7 +53,7 @@ def export_csvs(p: Project, outdir: str) -> list[str]:
     fn = os.path.join(outdir, "provenance_legend.csv")
     write_csv(fn, ["label", "meaning"], [[k.value, v] for k, v in PROV_DESCRIPTIONS.items()])
     files.append(fn)
-    turns = [(kin.name, kind, tr) for kin in p.kins if kin is not None for kind in ("screen", "compensated")
+    turns = [(kin.name, kind, tr) for kin in p.kins if kin is not None for kind in ("screen", "compensated", "static_assumed")
              for tr in kin.turns.get(kind, [])]
     if turns:
         fn = os.path.join(outdir, "turns.csv")
@@ -213,8 +213,10 @@ def _stat_rows(kin, lab_ang: str) -> list[str]:
                     f"{s['screen_omega_median_deg_s']:.4g} / {_fmt_pm(v, sg, 'deg/s')} | MEASURED+FOV |")
     vimg = kin.get("stab_speed")[kin.trusted]
     if np.isfinite(vimg).any():
-        rows.append(f"| Camera-compensated image speed, median | {np.nanmedian(vimg):.4g} ref-px/s | "
-                    f"{'MEASURED' if kin.params.use_camera else Prov.STATIC_CAM.value} |")
+        what = "Camera-compensated image speed" if kin.params.use_camera else \
+            "Object image speed (static camera ASSUMED = on-screen speed)"
+        rows.append(f"| {what}, median | {np.nanmedian(vimg):.4g} ref-px/s | "
+                    f"{'MEASURED' if kin.params.use_camera else Prov.STATIC_CAM_PX.value} |")
     if kin.has_angles():
         if "omega_median_deg_s" in s:
             v, sg, fr = s["omega_max_deg_s"]
@@ -262,7 +264,10 @@ def build_report(p: Project, figs: dict[str, str]) -> tuple[str, str]:
                           "paths, speeds and turns describe the image, not the object. "
                           + (cam.closure_info or ""))
         turns_s, turns_c = kin.turns.get("screen", []), kin.turns.get("compensated", [])
-        if turns_s:
+        if turns_s and not kp.use_camera:
+            md.append(f"- {kin.name}: {len(turns_s)} heading changes ≥45°, attributed to the object ONLY under the "
+                      "static-camera assumption (see section 5).")
+        elif turns_s:
             comp = (f"{len(turns_c)} (searched only within the {n_trusted / max(n_valid, 1):.0%} of the track with "
                     "trusted camera motion)") if (kp.use_camera and n_trusted) else "n/a"
             md.append(f"- {kin.name}: on-screen heading changes ≥45°: {len(turns_s)}; after camera compensation: "
@@ -342,24 +347,34 @@ def build_report(p: Project, figs: dict[str, str]) -> tuple[str, str]:
         md.append("| Quantity | Value | Label |")
         md.append("|---|---|---|")
         md.append(f"| Frames used / duration | {s['n_frames_used']} / {s['duration_used_s']:.3f} s | MEASURED |")
-        md.append(f"| Frames in compensated statistics (trusted camera motion in derivative window) | "
-                  f"{s['n_frames_trusted']} | MEASURED |")
+        if kp.use_camera:
+            md.append(f"| Frames in compensated statistics (trusted camera motion in derivative window) | "
+                      f"{s['n_frames_trusted']} | MEASURED |")
+        else:
+            md.append(f"| Frames in statistics (no camera check: static camera assumed) | "
+                      f"{s['n_frames_trusted']} | MEASURED |")
         md += _stat_rows(k, lab_ang)
         if k.role == "control":
             md.append("\nThis object was marked as a **control** (a feature fixed to the background). Its "
                       "camera-compensated motion should be zero: the values above are a direct measurement of the "
                       "camera-compensation error, and target motion of similar size is not distinguishable from it.")
         md.append("")
-    md.append("Uncertainties are 1σ from tracking noise and chained camera-registration error; they do not include "
-              "FOV calibration error or systematic effects listed in section 7.\n")
+    md.append("Uncertainties are 1σ from tracking noise"
+              + (" and chained camera-registration error" if kp.use_camera else
+                 " only (camera assumed static, so no camera-motion error is included; if the camera moved, the "
+                 "error is the camera's whole motion)")
+              + "; they do not include FOV calibration error or systematic effects listed in section 7.\n")
 
     md.append("## 5. Heading changes (turns)")
     any_turn = False
     for k in p.kins:
         if k is None:
             continue
-        for kind, title in (("screen", "on-screen path (includes camera motion)"),
-                            ("compensated", "camera-compensated path")):
+        kinds = ((("screen", "on-screen path (includes camera motion)"), ("compensated", "camera-compensated path"))
+                 if kp.use_camera else
+                 (("static_assumed", "object turns IF the camera was static (ASSUMED; identical to the on-screen "
+                                     "path)"),))
+        for kind, title in kinds:
             tl = k.turns.get(kind, [])
             if not tl:
                 continue
@@ -367,7 +382,10 @@ def build_report(p: Project, figs: dict[str, str]) -> tuple[str, str]:
             md.append(f"**{k.name}, {title}:** " + ", ".join(f"{tr['angle_deg']:.0f}° @ {tr['t']:.1f} s" for tr in tl))
     if any_turn:
         md.append("\nHeading change of the direction of motion, comparing 0.5 s before and after; only where the "
-                  "speed on both sides exceeds 3σ. Turns that appear only on screen are produced by camera motion.\n")
+                  "speed on both sides exceeds 3σ. "
+                  + ("Turns that appear only on screen are produced by camera motion.\n" if kp.use_camera else
+                     "With the camera assumed static, any camera slew in this interval would appear here as an "
+                     "object turn.\n"))
     else:
         md.append("No heading changes ≥45° detected.\n")
 

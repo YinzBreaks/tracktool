@@ -230,9 +230,11 @@ def kinematics_figure(kin: Kinematics, controls: Optional[list] = None) -> Figur
     _shade_low_conf(ax, t, low, v)
     ok = v & np.isfinite(kin.get("img_speed"))
     ax.plot(*_break_gaps(t[ok], kin.get("img_speed")[ok])[:2], color=C1, label="raw on-screen (not camera-compensated)")
-    _band(ax, t, masked(kin.get("stab_speed")), masked(kin.get("stab_speed_sigma")), C2, "camera-compensated")
+    if kin.params.use_camera:
+        _band(ax, t, masked(kin.get("stab_speed")), masked(kin.get("stab_speed_sigma")), C2, "camera-compensated")
     ax.set_ylabel("px/s")
-    ax.set_title("Image-plane speed [MEASURED]")
+    ax.set_title("Image-plane speed [MEASURED]" if kin.params.use_camera else
+                 "Image-plane speed [MEASURED] (static camera ASSUMED: all of it attributed to the object)")
     ax.legend(loc="upper right", fontsize=8)
     i += 1
     ax = axs[i]

@@ -418,7 +418,8 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
                      "omega", "omega_sigma", "alpha_x", "alpha_y", "alpha", "alpha_sigma", "alpha_lateral",
                      "alpha_lateral_sigma"):
             if name in cols:
-                cols[name] = (Prov.STATIC_CAM, cols[name][1], cols[name][2])
+                pv = Prov.STATIC_CAM_PX if name.startswith("stab_") else Prov.STATIC_CAM
+                cols[name] = (pv, cols[name][1], cols[name][2])
     if use_cam:
         low = usable & (conf < params.low_conf_threshold)
         if low.any():
@@ -443,5 +444,7 @@ def compute_kinematics(track: Track, camera: Optional[CameraTrack], frame_times:
     turns = {"screen": detect_turns(t, px, py, fx["d1"], fy["d1"], fx["s_d1"], fy["s_d1"], usable, seg),
              "compensated": detect_turns(t, ref[:, 0], ref[:, 1], gx["d1"], gy["d1"], gx["s_d1"], gy["s_d1"],
                                          trusted, seg) if use_cam else []}
+    if not use_cam:   # under the static-camera assumption the on-screen turns ARE the object's turns
+        turns["static_assumed"] = turns["screen"]
     return Kinematics(params=params, frame=frames, t=t, valid=usable & np.isfinite(px), flags=flags, cols=cols,
                       warnings=warnings, f0_px=f0, trusted=trusted, turns=turns, name=track.name, role=track.role)

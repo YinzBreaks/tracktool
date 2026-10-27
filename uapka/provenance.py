@@ -22,6 +22,8 @@ class Prov(str, Enum):
     # Angles of the object computed WITHOUT camera-motion compensation, under the explicit assumption that the
     # camera was not moving. Used when the user switches compensation off (e.g. camera motion unmeasurable).
     STATIC_CAM = "MEASURED+FOV+ASSUMED-STATIC-CAMERA"
+    # Same assumption, pixel quantities (no FOV involved).
+    STATIC_CAM_PX = "MEASURED+ASSUMED-STATIC-CAMERA"
 
 
 PROV_DESCRIPTIONS = {
@@ -33,6 +35,10 @@ PROV_DESCRIPTIONS = {
     Prov.STATIC_CAM: (
         "Measured image motion converted to angles with the FOV, attributing ALL of it to the object because the "
         "camera is ASSUMED static (camera-motion compensation switched off). Wrong if the camera moved."
+    ),
+    Prov.STATIC_CAM_PX: (
+        "Measured image motion in pixels, attributed entirely to the object because the camera is ASSUMED static "
+        "(camera-motion compensation switched off). Wrong if the camera moved."
     ),
     Prov.ASSUMED: (
         "Depends on a scenario assumption (slant range, object size, or altitude). "
