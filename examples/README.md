@@ -97,3 +97,62 @@ to the background.
   observer-velocity assumption (`--observer-v`), see the README.
 - **No range information in either clip.** Speeds in m/s and accelerations in g are available only as
   explicit scenario sweeps.
+
+## GOFAST (Navy ATFLIR, Jan 2015, NAVAIR FOIA release 2020)
+
+**Why this clip.** It is the only released UAP video where the sensor's zoom mode is readable on the
+HUD ("NAR, Z 1.0"), the mode has a published field of view, and the HUD also shows slant range,
+closure, altitude, Mach, heading and gimbal angles. Every step of the chain from pixels to m/s can
+therefore be labelled with what it rests on. Files: `gofast_project.json` (masks, 789 object
+positions, FOV estimate, scenario), `gofast_hud_readouts.json` (the HUD values, read by eye),
+`gofast_parallax.py` (the per-frame parallax correction).
+
+```bash
+python -m uapka analyze "3 - GOFAST.mp4" --project examples/gofast_project.json --out out/gofast
+python examples/gofast_parallax.py out/gofast/per_frame.csv out/gofast
+```
+
+**What the footage is.** 640×480, 29.97 fps, 34.4 s, no duplicates. The sensor image is a 427×428
+inset; the symbology is white (not coloured), so it is masked by brightness per frame in the project.
+IR polarity flips to white-hot for ~3 s at 24 s. The pod is not locked for the first 12 s and its
+own designator box hides the object there; the analysis uses 12–34 s.
+
+**FOV.** 0.7° from the HUD label through a lookup table, `DERIVED-FOV(hud)`, σ 20%: the 0.7° NAR
+figure is quoted by Forecast International and Metabunk; one simulator wiki says 1.5°. Every angular
+and speed value below scales with it.
+
+**Measured.** The pod holds the object on screen to 0.35 px/s. Relative to the sea background the
+line of sight moves at **0.555°/s** (5th–95th percentile 0.50–0.61) along a straight line; angular
+acceleration is at the noise floor (0.014°/s²). Camera motion is trusted for 577 of 672 frames
+(median confidence 0.71) after the adaptive-threshold change this clip prompted. Two controls on the
+sea are not possible (nothing on the sea is fixed), so the long-baseline closure check is the
+verification here: 132 intervals consistent, 47 corrected, 13 unverifiable.
+
+**Range: HUD readout, not a sweep.** RNG 4.4 → 3.4 NM between 13 s and 32 s; a linear fit gives
+−96 m/s range rate, matching the HUD closure (Vc 210 → 150 kt). The aircraft's along-LOS speed from
+Mach 0.61 and the gimbal angles is 85–143 m/s, so the object also has a small radial component
+away from the aircraft (tens of m/s).
+
+**Parallax.** The naive conversion `v = R·ω` gives 57–74 m/s (112–144 kt) *relative to the sea*. The
+F/A-18 is doing ~189 m/s true, the LOS is 35–57° off the nose and 22–34° down, so the aircraft's
+velocity across the LOS is ~130–160 m/s, and the sea it is registered against is at 14–20 km while
+the object is at 6–8 km: they shift by different amounts. With `v_obj = R·ω + v_ac⊥·(1 − R/R_sea)`
+(`background_range_m` in the scenario spec; the per-frame version in `gofast_parallax.py` uses the
+HUD angles and range at each time):
+
+| Quantity | Value | Rests on |
+|---|---|---|
+| LOS rate relative to the sea | 0.555°/s | MEASURED + FOV(hud) |
+| Naive speed across the LOS (background at infinity) | 67 m/s (130 kt) median | + HUD range |
+| Stationary-object prediction of the sea-relative rate | 0.66°/s | HUD Mach, altitude, gimbal angles |
+| **Parallax-corrected speed across the LOS** | **~26 m/s (50 kt)** median, 18–36 m/s over ±20% in FOV or sea range | + HUD Mach/altitude/angles, wings level ASSUMED |
+| Direction check | sea-relative motion within ~16° of anti-parallel to the aircraft's lateral velocity | — |
+| Lateral acceleration | peak ~1 g ± 0.5 g, floor 0.2 g, not significant | all of the above |
+
+The direction test is the point of the exercise: if the object were stationary, its motion relative
+to the sea must be exactly opposite the aircraft's lateral velocity in the image. It is within
+~16°, which an unknown bank angle alone can produce. The remaining ~26 m/s is consistent with a
+wind-blown object, in line with the NASA panel's reading of this clip, and is an order of magnitude
+below the naive number. Neither number is a measurement: both rest on the HUD range, and the
+corrected one additionally on true airspeed from Mach, the sea's slant range from altitude and
+depression angle, and a wings-level, no-sideslip assumption for the image orientation.

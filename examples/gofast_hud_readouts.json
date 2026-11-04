@@ -1,0 +1,19 @@
+{
+  "clip": "3 - GOFAST (NAVAIR FOIA release, April 2020), 640x480, 29.97 fps, 34.4 s",
+  "sha256": "02ec3458ad40d9db1d5385291c3fba53bfa7cf68113335a58e602967784cd559",
+  "sensor_inset_px": [104, 27, 427, 428],
+  "object_screen_px": [317.3, 240.8],
+  "readouts_by_eye": {
+    "note": "Read from the HUD symbology at the listed times (seconds into the clip); 1 deg / 0.1 NM quantisation.",
+    "fov_mode": "NAR, Z 1.0 (throughout)",
+    "ir_polarity": "BLK until ~23 s, WHT 24-26 s, BLK after",
+    "altitude_ft": 25000,
+    "mach": 0.61,
+    "heading_deg": {"0": 252, "8": 253, "20": 254, "24": 255, "32": 257},
+    "gimbal_azimuth_deg_left": {"0": 35, "1": 36, "2": 36, "3": 37, "4": 37, "5": 39, "6": 39, "7": 39, "8": 40, "9": 41, "10": 42, "11": 42, "12": 43, "13": 44, "14": 45, "15": 46, "16": 47, "20": 49, "24": 51, "28": 54, "32": 57},
+    "gimbal_elevation_deg_below_horizon": {"0": 22, "1": 22, "2": 23, "3": 23, "4": 23, "5": 24, "6": 24, "7": 24, "8": 24, "9": 25, "10": 25, "11": 26, "12": 26, "13": 26, "14": 27, "15": 27, "16": 27, "20": 29, "24": 31, "28": 33, "32": 34},
+    "range_nmi": {"13": 4.4, "14": 4.3, "15": 4.3, "16": 4.2, "20": 4.0, "24": 3.8, "28": 3.6, "32": 3.4},
+    "closure_kt": {"13": 210, "16": 200, "20": 190, "24": 180, "28": 170, "32": 150}
+  },
+  "fov_table_deg": {"NAR": 0.7, "MFOV": 2.8, "WFOV": 6.0, "source": "ATFLIR specs as quoted by Forecast International and Metabunk; one simulator wiki gives NAR = 1.5 deg", "sigma_pct_used": 20}
+}

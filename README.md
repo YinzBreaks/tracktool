@@ -365,7 +365,10 @@ the full frame would overstate every angle by (frame width / inset width).
 ### 5. Scenarios (`scenarios.py`): ASSUMED only
 For an assumed range R (held constant):
 
-- transverse speed v = R·ω, plus the assumed observer velocity
+- transverse speed v = R·ω, plus the assumed observer velocity across the LOS. If the camera motion
+  was registered against a background at a finite range R_bg (sea, terrain), the observer term is
+  scaled by (1 − R/R_bg), because the observer's motion shifts that background too (see the GOFAST
+  case study in `examples/`, where this is the difference between 130 kt and 50 kt)
 - acceleration a = R·α
 - lateral acceleration a_lat = R·α_lateral
 
