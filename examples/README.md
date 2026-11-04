@@ -157,25 +157,57 @@ below the naive number. Neither number is a measurement: both rest on the HUD ra
 corrected one additionally on true airspeed from Mach, the sea's slant range from altitude and
 depression angle, and a wings-level, no-sideslip assumption for the image orientation.
 
-### Middle East Object: parallax under the MQ-9 cruise assumptions
+### Middle East Object: viewing geometry from a satellite map, and parallax
 
-`middle_east_parallax.py` applies the finite-background correction with Bellingcat's assumptions
-(25,000 ft, 150–170 kt, flying toward the scene). Nothing in the HUD survives redaction, so the
-ground scale comes from Bellingcat's geolocated aim points (0.165 m/px) and the object's height above
-ground is swept. In ground terms the correction is `v_obj = (1 − h/A)·s_rel − v_ac⊥·(h/A)`.
+Files: `middle_east_project.json` (segment 3.2–24.7 s, side panels and reticle masked, the object's
+positions taken from the sensor's own track gate, one control on a roof), `middle_east_geometry.py` (the
+geometry below), `middle_east_parallax.py` (the earlier sweep that assumed an isotropic 0.165 m/px and swept
+the depression angle). Video `DOD_109584445.mp4`, SHA-256
+`030f45a791b5e8d3fe2c28c96fd65dbd5fc318fcd390493061d426f8296fecba`.
 
-Measured input: the object's LOS speed relative to the ground texture, **45 m/s median** (p5–p95
-12–89 m/s over the 28 frames with trusted camera motion). Direction check: the ground-relative motion
-is ~21° from straight "down" the image, i.e. toward the near side, which is what a stationary object
-below a forward-flying drone produces.
+```bash
+python -m uapka analyze DOD_109584445.mp4 --project examples/middle_east_project.json --out out/me
+python examples/middle_east_geometry.py out/me/per_frame.csv
+```
+
+**Why the plane resection does not give the FOV here.** The drone is ~10 km from a scene a few hundred
+metres across, so the ground maps to the image by an affine transform: four or six ground coordinates fit
+a homography with no usable perspective, the focal length is undetermined, and `estimate_ground` says so
+(`FOCAL LENGTH POORLY DETERMINED`). A first attempt, four corners of a 45 × 50 m rectangle, failed
+for a second reason as well: the pins did not outline the structure in the video. What the affine map still
+carries is reported in the new `weak_perspective` diagnostics: the orientation, the metres per pixel across
+and along the look direction, and their ratio, which is the sine of the look-down angle.
+
+**How the correspondence was established.** The HUD's red arrow is not a north arrow (treating it as one
+sends every pairing to the wrong compound). The camera track was used to build a mosaic of frames 270–430,
+on which the big walled courtyard, its tree, the trench along its east berm, the compounds north of it and
+the plowed fields are all recognisable; five correspondences to a north-up Google Earth screenshot
+(georeferenced from five pins read in Google Earth, consistent to 1 px) fixed the affine map, which was
+then refined by gradient correlation. The video is roughly south-up (North 193° clockwise from image-up).
+The structure under the reticle at 9 s is the shed just west of the road at Bellingcat's aim point A; the
+flat-roofed building north of it sits under a redaction box.
+
+| Quantity | Value | Rests on |
+|---|---|---|
+| Metres per pixel across / along the look direction | 0.156 / 0.247 | MEASURED (map ↔ mosaic affine, square pixels assumed) |
+| Look-down angle | **39° ± 5°** | MEASURED (foreshortening ratio 0.63) |
+| Line toward the aircraft in the image | 34° left of image-up, which is exactly the HUD's red arrow | MEASURED; the arrow is an aircraft pointer |
+| Ground heading of that line | 326° or 146° (affine cannot tell near from far) | MEASURED |
+| Slant range, HFOV of the 558-px inset / full 1280-px frame | 11.7 km, 0.43° / 0.98° at 25,000 ft; 9.3 km, 0.54° / 1.23° at 20,000 ft | + ASSUMED altitude |
+| Aim displacement 7.57 → 23.59 s | 872 m at heading 7° from the camera chain, vs Bellingcat's 751 m at 45° | unresolved; the chain's confidence is low over the fields |
+
+**Parallax, re-run with the measured geometry.** The object's motion is along the image vertical, where the
+scale is 0.25 m/px rather than the isotropic 0.165 m/px used before, so its ground-relative speed is
+**64 m/s median** (p5–p95 29–87 m/s, 28 trusted frames), heading ≈ 351°. With the look-down angle measured
+(39°) and the altitude assumed (25,000 ft), `v_obj = (1 − h/A)·s_rel − v_ac⊥·(h/A)`:
 
 | Object height AGL | 0 m | 1 km | 2 km | 3 km | 4 km | stationary at |
 |---|---|---|---|---|---|---|
-| Object speed, 45° depression, 160 kt | 45 m/s | 32 | 18 | 5 | −9 | **~3.3 km** |
-| 30° / 75° depression | 45 | 34 / 29 | 23 / 13 | 11 / −4 | 0 / −21 | 4.0 / 2.8 km |
+| 150–170 kt, LOS along the direction of flight | 64 m/s | 48–49 | 32–34 | 16–19 | 0–3 | **4.0–4.2 km** |
+| 150–170 kt, LOS 90° off the heading | 64 | 44–45 | 23–26 | 3–7 | −18 to −12 | 3.1–3.4 km |
 
-A stationary object (a balloon) reproduces the measured motion at roughly 3 km above ground under
-every combination of speed and depression tried; a lower object must be moving, up to 45 m/s if it
-were on the ground. The video cannot pick the height. The depression angle is itself unmeasured here
-and fixes the implied FOV (0.35–0.67°); the plane-resection method would measure both from four or
-more ground coordinates in one frame.
+A stationary object (a balloon) still reproduces the measurement, now at 3–4 km above ground; an object on
+the ground would be doing 64 m/s. The stationary case also needs the aircraft's lateral motion anti-parallel
+to the object's ground-relative motion, i.e. an aircraft heading near 171°; nothing in the video gives the
+heading, and Bellingcat's "flying toward the scene" is one guess among several. The altitude remains the
+one assumption that scales the ranges and speeds; the look-down angle no longer has to be guessed.

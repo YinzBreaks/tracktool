@@ -848,6 +848,49 @@ def _ground_solve(w: float, h: float, par: float, img: np.ndarray, enu: np.ndarr
                 res_px=res_px, res_m=res_m, uv=uv, origin_c=c)
 
 
+def _weak_perspective(w: float, h: float, par: float, img: np.ndarray, enu: np.ndarray) -> dict:
+    """Affine (weak-perspective) fit plane -> image, for views with no usable perspective (long range).
+
+    When the camera is far compared with the spread of the points, the plane maps to the image by an affine
+    transform: a rotation, then an anisotropic scaling whose two factors are the metres-per-pixel across the
+    look direction (g_across) and along it (g_along = g_across / sin(elevation)). The singular values of the
+    2x2 part therefore give the look-down angle, the compressed image axis is the direction toward (or away
+    from) the camera, and the map's rotation gives where North points in the image. None of this needs f.
+    Assumes square sensor pixels after `par`: an anisotropic display scaling would masquerade as foreshortening.
+    """
+    c, e1, e2, n, plane_rms = _plane_frame(enu)
+    d = enu - c
+    uv = np.column_stack([d @ e1, d @ e2])
+    xy = np.column_stack([img[:, 0] - w / 2.0, (img[:, 1] - h / 2.0) / par])
+    A = np.column_stack([uv, np.ones(len(uv))])
+    sol, *_ = np.linalg.lstsq(A, xy, rcond=None)                 # xy ≈ [uv 1] @ sol
+    rep = A @ sol
+    res = np.column_stack([rep[:, 0] - xy[:, 0], (rep[:, 1] - xy[:, 1]) * par])
+    rms = math.sqrt(float(np.mean(np.sum(res ** 2, axis=1))))
+    J = sol[:2].T                                                 # metres (u, v) -> normalised image px
+    J = np.diag([1.0, par]) @ J                                   # -> screen px
+    U, S, Vt = np.linalg.svd(J)
+    ratio = float(S[1] / S[0]) if S[0] > 0 else float("nan")
+    elev = math.degrees(math.asin(min(1.0, ratio))) if np.isfinite(ratio) else float("nan")
+    ax = U[:, 1]                                                  # most compressed image direction
+    ax_img = math.degrees(math.atan2(ax[0], -ax[1])) % 360.0       # clockwise from image-up
+    Ji = np.linalg.pinv(J)
+    g = Ji @ ax                                                   # that direction on the plane (u, v)
+    g_enu = g[0] * e1 + g[1] * e2
+    look_hdg = math.degrees(math.atan2(g_enu[0], g_enu[1])) % 360.0
+    north_p = np.array([e1[1], e2[1]])                            # ENU North projected into plane coords
+    nimg = J @ north_p
+    north_img = math.degrees(math.atan2(nimg[0], -nimg[1])) % 360.0
+    east_p = np.array([e1[0], e2[0]])
+    eimg = J @ east_p
+    east_img = math.degrees(math.atan2(eimg[0], -eimg[1])) % 360.0
+    return dict(J=J, ratio=ratio, elevation=elev, gsd_across=1.0 / S[0] if S[0] > 0 else float("nan"),
+                gsd_along=1.0 / S[1] if S[1] > 0 else float("nan"), look_axis_image_deg=ax_img,
+                look_headings=(look_hdg, (look_hdg + 180.0) % 360.0), north_image_deg=north_img,
+                east_image_deg=east_img, rms_px=rms, res_px=[float(v) for v in np.linalg.norm(res, axis=1)],
+                plane_rms=plane_rms)
+
+
 def estimate_ground(width: int, height: int, points: Sequence[tuple[Point, tuple[float, float, float]]],
                     point_sigma_m: float = 0.0, click_sigma_px: float = DEFAULT_CLICK_SIGMA_PX,
                     pixel_aspect: float = 1.0, region: Optional[Region] = None,
@@ -1010,6 +1053,43 @@ def estimate_ground(width: int, height: int, points: Sequence[tuple[Point, tuple
                          f"The metres-per-pixel at the image centre IS well determined: {gsd:.4g} ± {gsd_sigma:.2g} "
                          "m/px (use it for ground-relative speeds). More oblique footage, or a wider spread of "
                          "points in depth, would determine the FOV.")
+        # weak perspective: the affine map still carries the look-down angle (foreshortening), the across/along
+        # scales and the orientation; the FOV then follows from an ASSUMED camera height
+        def wp(q):
+            img_ = np.array([[q[f"{nm}.x"], q[f"{nm}.y"]] for nm in names])
+            enu_ = enu0 + np.array([[q[f"{nm}.e"], q[f"{nm}.n"], q[f"{nm}.u"]] for nm in names])
+            return _weak_perspective(w, h, par, img_, enu_)
+        wbase = wp(params)
+        el_wp, el_sig, _ = _propagate(lambda q: wp(q)["elevation"], params, sig)
+        ga, ga_sig, _ = _propagate(lambda q: wp(q)["gsd_across"], params, sig)
+        gl, gl_sig, _ = _propagate(lambda q: wp(q)["gsd_along"], params, sig)
+        sin_el = math.sin(math.radians(el_wp)) if np.isfinite(el_wp) and el_wp > 0 else float("nan")
+        hfov_per_km = math.degrees(2.0 * math.atan(0.5 * w * ga * sin_el / 1000.0)) if np.isfinite(sin_el) else float("nan")
+        diag["weak_perspective"] = {
+            "elevation_deg": el_wp, "elevation_sigma_deg": el_sig, "foreshortening_ratio": wbase["ratio"],
+            "ground_sample_across_m_per_px": ga, "ground_sample_across_sigma_m_per_px": ga_sig,
+            "ground_sample_along_m_per_px": gl, "ground_sample_along_sigma_m_per_px": gl_sig,
+            "look_axis_image_deg_cw_from_up": wbase["look_axis_image_deg"],
+            "look_axis_ground_headings_deg": list(wbase["look_headings"]),
+            "north_image_deg_cw_from_up": wbase["north_image_deg"], "east_image_deg_cw_from_up": wbase["east_image_deg"],
+            "affine_rms_px": wbase["rms_px"], "point_residuals_px": wbase["res_px"],
+            "hfov_deg_at_1km_height": hfov_per_km,
+        }
+        diag["elevation_deg"] = el_wp
+        diag["elevation_sigma_deg"] = el_sig
+        diag["elevation_source"] = "foreshortening (weak perspective)"
+        diag["azimuth_deg"] = float("nan")
+        est.notes.append(f"WEAK-PERSPECTIVE GEOMETRY (no f needed): the plane-to-image map is affine with "
+                         f"{ga:.4g} ± {ga_sig:.2g} m/px across the look direction and {gl:.4g} ± {gl_sig:.2g} m/px "
+                         f"along it (fit RMS {wbase['rms_px']:.2g} px). Their ratio {wbase['ratio']:.3f} is "
+                         f"sin(look-down angle): elevation {el_wp:.1f} ± {el_sig:.1f} deg below the horizontal "
+                         "[MEASURED, assumes square pixels: display anisotropy would masquerade as foreshortening]. "
+                         f"The compressed image axis ({wbase['look_axis_image_deg']:.0f} deg clockwise from image-up) "
+                         f"is the line toward the camera, ground heading {wbase['look_headings'][0]:.0f} or "
+                         f"{wbase['look_headings'][1]:.0f} deg (an affine map cannot tell near from far); North "
+                         f"points {wbase['north_image_deg']:.0f} deg clockwise from image-up. The HFOV needs an "
+                         f"ASSUMED camera height H above the plane: HFOV ≈ {hfov_per_km:.4g} deg × (1 km / H), "
+                         "slant range = H / sin(elevation).")
     else:
         if base["depth_ratio"] < 1.1:
             est.notes.append(f"Little perspective in this view (depth ratio across the points "
@@ -1024,10 +1104,16 @@ def estimate_ground(width: int, height: int, points: Sequence[tuple[Point, tuple
                              "from their least-squares combination. Treat the HFOV with caution.")
     if not np.isfinite(base["slant_range"]):
         est.notes.append("The image centre looks above the ground plane (no aim point / slant range).")
-    est.notes.append(f"Recovered camera position ({cam_geo[0]:.6f}, {cam_geo[1]:.6f}, {cam_geo[2]:.1f} m), "
-                     f"{base['height']:.1f} m above the ground plane, looking az {base['azimuth']:.1f} deg, "
-                     f"elevation {base['elevation']:.1f} deg; slant range to the image centre "
-                     f"{base['slant_range']:.1f} ± {rng_sigma:.2g} m; {gsd:.4g} ± {gsd_sigma:.2g} m/px there.")
+    if degenerate:
+        est.notes.append(f"The full solve's camera position ({cam_geo[0]:.6f}, {cam_geo[1]:.6f}, {cam_geo[2]:.1f} m), "
+                         f"azimuth {base['azimuth']:.1f} deg, elevation {base['elevation']:.1f} deg and slant range "
+                         f"{base['slant_range']:.1f} m rest on the undetermined f: NOT usable. Use the weak-perspective "
+                         "elevation above; the range needs an assumed height.")
+    else:
+        est.notes.append(f"Recovered camera position ({cam_geo[0]:.6f}, {cam_geo[1]:.6f}, {cam_geo[2]:.1f} m), "
+                         f"{base['height']:.1f} m above the ground plane, looking az {base['azimuth']:.1f} deg, "
+                         f"elevation {base['elevation']:.1f} deg; slant range to the image centre "
+                         f"{base['slant_range']:.1f} ± {rng_sigma:.2g} m; {gsd:.4g} ± {gsd_sigma:.2g} m/px there.")
     if point_sigma_m <= 0:
         est.notes.append("No position uncertainty given for the ground points: σ reflects click uncertainty only.")
     _region_note(est)

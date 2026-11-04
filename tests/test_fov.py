@@ -666,3 +666,32 @@ def test_cli_fov_ground_and_region(tmp_path, capsys):
     # applying an inset estimate through analyze carries the region into the project
     p = Project()
     assert p.apply_fov(ests[1]) == [] and p.kin_params.image_region == [320.0, 180.0, 1280.0, 720.0]
+
+
+def test_ground_weak_perspective_gives_look_angle_and_scales():
+    """Long range, little perspective: f is undetermined, but the affine foreshortening gives the look-down angle,
+    the across/along scales, the orientation and the HFOV per unit camera height."""
+    w, h = 1280, 720
+    pts = [(300.0, 150.0), (1000.0, 180.0), (640.0, 360.0), (250.0, 600.0), (1050.0, 580.0), (700.0, 250.0)]
+    for look_down, roll, height in ((40.0, 25.0, 7000.0), (25.0, -40.0, 5000.0)):
+        points, cam, gsd, rng = _ground_scene(w, h, 0.5, look_down, height_m=height, roll_deg=roll, pts=pts)
+        est = estimate_ground(w, h, points, click_sigma_px=1.0, point_sigma_m=1.0)
+        d = est.diagnostics
+        assert d["perspective_depth_ratio"] < 1.02 and any("WEAK-PERSPECTIVE" in n for n in est.notes)
+        wp = d["weak_perspective"]
+        assert wp["elevation_deg"] == pytest.approx(look_down, abs=0.3)
+        assert d["elevation_deg"] == wp["elevation_deg"] and "foreshortening" in d["elevation_source"]
+        assert 0 < wp["elevation_sigma_deg"] < 6.0
+        assert wp["affine_rms_px"] < 1.5
+        # the camera sits due south of the points (looking north): the look axis heads 0/180
+        assert min(abs(((x + 90) % 180) - 90) for x in wp["look_axis_ground_headings_deg"]) < 1.0
+        # the compressed image axis is 'down' rotated by the roll; North is 'up' rotated by -roll
+        wrap = lambda a: (a + 180.0) % 360.0 - 180.0
+        assert wrap(wp["look_axis_image_deg_cw_from_up"] - (180.0 - roll)) == pytest.approx(0.0, abs=1.0)
+        assert wrap(wp["north_image_deg_cw_from_up"] + roll) == pytest.approx(0.0, abs=1.0)
+        # scales: across x along = gsd^2 at the centre; along = across / sin(look-down)
+        assert wp["ground_sample_across_m_per_px"] * wp["ground_sample_along_m_per_px"] == pytest.approx(gsd ** 2, rel=0.02)
+        assert wp["ground_sample_along_m_per_px"] / wp["ground_sample_across_m_per_px"] == pytest.approx(
+            1.0 / math.sin(math.radians(look_down)), rel=0.01)
+        # HFOV follows from the (assumed) camera height
+        assert wp["hfov_deg_at_1km_height"] / (height / 1000.0) == pytest.approx(0.5, rel=0.01)
