@@ -39,6 +39,11 @@ class ScenarioSpec:
     elevation_deg: float = 0.0          # altitude mode: LOS elevation (negative = looking down)
     observer_vx_ms: float = 0.0         # assumed observer velocity across LOS, image +x (right)
     observer_vy_ms: float = 0.0         # assumed observer velocity across LOS, image +y (up)
+    # Range of the BACKGROUND the camera motion was registered against (sea, terrain, clouds), in metres;
+    # 0 = infinitely far. A moving observer shifts a finite background too, so the object's motion relative to
+    # the background only equals its inertial motion when the background is at infinity:
+    #   v_obj = R*omega_rel + v_obs*(1 - R/R_bg)
+    background_range_m: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -107,6 +112,13 @@ def ranges_from_spec(spec: ScenarioSpec, kin: Optional[Kinematics] = None) -> tu
     if spec.observer_vx_ms or spec.observer_vy_ms:
         notes.append(f"ASSUMED observer velocity across the LOS ({spec.observer_vx_ms:g}, {spec.observer_vy_ms:g}) m/s "
                      "(image right, up) is added to remove platform-motion parallax.")
+        if spec.background_range_m > 0:
+            notes.append(f"ASSUMED background range {fmt_length(spec.background_range_m)}: the registered background "
+                         "itself shifts under the observer's motion, so the observer term is scaled by "
+                         "(1 - R/R_background) for each assumed object range R.")
+        else:
+            notes.append("Background assumed infinitely far: the observer term is applied in full. If the background "
+                         "(sea, terrain) is at a finite range, set background_range_m; otherwise speeds are biased.")
     else:
         notes.append("Observer (camera platform) motion NOT removed: velocities are relative to the camera.")
     return out, notes
@@ -136,8 +148,9 @@ def compute_scenarios(kin: Kinematics, spec: ScenarioSpec) -> ScenarioResult:
     rows: list[ScenarioRow] = []
     ts: dict = {}
     for R, label in rngs:
-        vx = R * wx + spec.observer_vx_ms
-        vy = R * wy + spec.observer_vy_ms
+        bg = (1.0 - R / spec.background_range_m) if spec.background_range_m > 0 else 1.0
+        vx = R * wx + spec.observer_vx_ms * bg
+        vy = R * wy + spec.observer_vy_ms * bg
         v = np.hypot(vx, vy)
         s_v = R * sw
         ag, s_ag = R * a / G0, R * sa / G0

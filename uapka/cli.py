@@ -179,6 +179,9 @@ def cmd_analyze(a) -> int:
             p.scenario = ScenarioSpec(mode="altitude", values=a.altitudes, cam_altitude=a.cam_alt or "0m",
                                       elevation_deg=a.elevation or 0.0)
         p.scenario.observer_vx_ms, p.scenario.observer_vy_ms = a.observer_v or (0.0, 0.0)
+        if a.background_range:
+            from .units import parse_length
+            p.scenario.background_range_m = parse_length(a.background_range)
 
     if a.start is not None:
         p.segment_start_s = a.start
@@ -370,6 +373,8 @@ def main(argv=None) -> int:
     z.add_argument("--elevation", type=float, help="LOS elevation angle in degrees for --altitudes (negative = down)")
     z.add_argument("--observer-v", type=float, nargs=2, metavar=("VX", "VY"),
                    help="ASSUMED observer velocity across the LOS in m/s (image right, up)")
+    z.add_argument("--background-range", help="ASSUMED range of the registered background (e.g. '16km'); with "
+                   "--observer-v, scales the observer term by (1 - R/R_bg). Default: infinitely far")
     z.add_argument("--no-video", action="store_true", help="skip the annotated video")
     z.add_argument("--compare-naive", action="store_true", help="also print naive phase-correlation camera pan")
     z.set_defaults(fn=cmd_analyze)

@@ -158,3 +158,18 @@ def test_static_camera_assumption_is_labelled(lossless_project, tmp_path):
     finally:
         p.kin_params.use_camera = True
         p.run_kinematics()
+
+
+def test_background_range_scales_observer_term(lossless_project):
+    kin = lossless_project.kin
+    base = compute_scenarios(kin, ScenarioSpec(mode="range", values="2km", observer_vx_ms=100.0))
+    near = compute_scenarios(kin, ScenarioSpec(mode="range", values="2km", observer_vx_ms=100.0, background_range_m=4000.0))
+    far = compute_scenarios(kin, ScenarioSpec(mode="range", values="2km", observer_vx_ms=100.0, background_range_m=1e12))
+    # at R = R_bg/2 only half the observer velocity applies; at R_bg -> inf the full term applies
+    vb, vn, vf = (r.timeseries[2000.0]["v"] for r in (base, near, far))
+    ok = kin.trusted & kin.valid & np.isfinite(vb)
+    assert np.allclose(vf[ok], vb[ok], rtol=1e-6)
+    wx = np.radians(kin.get("omega_x")); wy = np.radians(kin.get("omega_y"))
+    expect = np.hypot(2000 * wx + 50.0, 2000 * wy)
+    assert np.allclose(vn[ok], expect[ok], rtol=1e-6)
+    assert any("background range" in n for n in near.notes)

@@ -211,11 +211,23 @@ def _feature_register(prev_c: np.ndarray, cur_c: np.ndarray, excluded: np.ndarra
     n_tracked = len(src)
     if n_tracked < params.min_inliers:
         return None
-    M1, inl1 = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=params.ransac_thresh_px,
-                                           maxIters=3000, confidence=0.995)
+    # Match noise differs by orders of magnitude between footage (0.1 px on clean synthetic frames, 2-3 px on
+    # low-contrast, motion-blurred sea): a fixed 1 px RANSAC threshold then keeps a small lucky subset and the
+    # fit jumps from frame to frame. Widen the threshold until at least half the matches are explained, then
+    # refine on the inliers; the step sigma below is based on the measured residual, so honesty is kept.
+    thr_used = params.ransac_thresh_px
+    M1 = inl1 = None
+    for thr in (params.ransac_thresh_px, 2 * params.ransac_thresh_px, 3 * params.ransac_thresh_px):
+        M1, inl1 = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=thr,
+                                               maxIters=3000, confidence=0.995)
+        thr_used = thr
+        if M1 is not None and inl1.sum() >= 0.5 * n_tracked:
+            break
     if M1 is None:
         return None
     flags: list[str] = []
+    if thr_used > params.ransac_thresh_px:
+        flags.append(f"NOISY_MATCHES_{thr_used:g}PX")
     inl1 = inl1.ravel().astype(bool)
     n1 = int(inl1.sum())
     M, inl = M1, inl1
@@ -224,7 +236,7 @@ def _feature_register(prev_c: np.ndarray, cur_c: np.ndarray, excluded: np.ndarra
     ambiguity = 0.0
     if rest.sum() >= params.min_inliers:
         M2, inl2 = cv2.estimateAffinePartial2D(src[rest], dst[rest], method=cv2.RANSAC,
-                                               ransacReprojThreshold=params.ransac_thresh_px,
+                                               ransacReprojThreshold=thr_used,
                                                maxIters=2000, confidence=0.99)
         if M2 is not None:
             n2 = int(inl2.sum())
@@ -240,6 +252,10 @@ def _feature_register(prev_c: np.ndarray, cur_c: np.ndarray, excluded: np.ndarra
                     flags.append("CHOSE_MOVING_OVER_STATIC_CLUSTER")
                 flags.append("STATIC_CLUSTER_PRESENT" if (id1 or id2) else "TWO_MOTION_CLUSTERS")
     n_in = int(inl.sum())
+    if n_in >= 4:
+        M_ls, _ = cv2.estimateAffinePartial2D(src[inl], dst[inl], method=cv2.LMEDS)   # LS-type refine on inliers
+        if M_ls is not None:
+            M = M_ls
     if params.motion_model == "translation" and n_in >= 3:
         t_only = np.median(dst[inl] - src[inl], axis=0)
         M = np.array([[1, 0, t_only[0]], [0, 1, t_only[1]]], float)
@@ -250,7 +266,7 @@ def _feature_register(prev_c: np.ndarray, cur_c: np.ndarray, excluded: np.ndarra
     c_ratio = np.clip((n_in / max(n_tracked, 1) - 0.2) / 0.6, 0, 1)
     # Inlier residuals of real footage sit at 0.5-0.9 px (interpolation, slight parallax, compression); only a
     # residual approaching the RANSAC threshold means the model does not fit. Synthetic frames reach ~0.1 px.
-    c_resid = float(np.exp(-(rms / 1.5) ** 2))
+    c_resid = float(np.exp(-(rms / (1.5 * thr_used)) ** 2))
     c_cov = np.clip(coverage / 0.5, 0, 1)
     quality = float((max(c_count, 1e-3) * max(c_ratio, 1e-3) * c_resid * max(c_cov, 1e-3)) ** 0.25)
     quality *= 1.0 - 0.6 * ambiguity
