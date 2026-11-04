@@ -156,3 +156,26 @@ wind-blown object, in line with the NASA panel's reading of this clip, and is an
 below the naive number. Neither number is a measurement: both rest on the HUD range, and the
 corrected one additionally on true airspeed from Mach, the sea's slant range from altitude and
 depression angle, and a wings-level, no-sideslip assumption for the image orientation.
+
+### Middle East Object: parallax under the MQ-9 cruise assumptions
+
+`middle_east_parallax.py` applies the finite-background correction with Bellingcat's assumptions
+(25,000 ft, 150–170 kt, flying toward the scene). Nothing in the HUD survives redaction, so the
+ground scale comes from Bellingcat's geolocated aim points (0.165 m/px) and the object's height above
+ground is swept. In ground terms the correction is `v_obj = (1 − h/A)·s_rel − v_ac⊥·(h/A)`.
+
+Measured input: the object's LOS speed relative to the ground texture, **45 m/s median** (p5–p95
+12–89 m/s over the 28 frames with trusted camera motion). Direction check: the ground-relative motion
+is ~21° from straight "down" the image, i.e. toward the near side, which is what a stationary object
+below a forward-flying drone produces.
+
+| Object height AGL | 0 m | 1 km | 2 km | 3 km | 4 km | stationary at |
+|---|---|---|---|---|---|---|
+| Object speed, 45° depression, 160 kt | 45 m/s | 32 | 18 | 5 | −9 | **~3.3 km** |
+| 30° / 75° depression | 45 | 34 / 29 | 23 / 13 | 11 / −4 | 0 / −21 | 4.0 / 2.8 km |
+
+A stationary object (a balloon) reproduces the measured motion at roughly 3 km above ground under
+every combination of speed and depression tried; a lower object must be moving, up to 45 m/s if it
+were on the ground. The video cannot pick the height. The depression angle is itself unmeasured here
+and fixes the implied FOV (0.35–0.67°); the plane-resection method would measure both from four or
+more ground coordinates in one frame.
